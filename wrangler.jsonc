@@ -1,0 +1,19 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "mizukure",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-09-01",
+  "observability": { "enabled": true },
+
+  // public/ is served as static files; anything else (e.g. /api/judge) goes to src/worker.js
+  "assets": { "directory": "./public", "binding": "ASSETS" },
+
+  // Workers AI (vision model that turns the photo into text for Jev)
+  "ai": { "binding": "AI" },
+
+  "vars": {
+    "VISION_MODEL": "@cf/meta/llama-4-scout-17b-16e-instruct",
+    "JEV_MODEL": "jev-latest"
+  }
+  // Secret (not stored here):  npx wrangler secret put TYPESAFE_API_KEY
+}
