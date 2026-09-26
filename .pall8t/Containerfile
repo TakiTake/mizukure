@@ -1,0 +1,36 @@
+FROM ubuntu:24.04
+
+ARG UID=501
+ARG GID=501
+
+# Sandbox image for working on mizukure with an AI agent (pall8t run).
+# Based on pall8t's default image (node + claude CLI + gh), kept in the repo
+# so the sandbox doesn't depend on whatever ~/.pall8t/Containerfile holds.
+#
+# Node 22: wrangler 4 and its deps require node >= 22. wrangler itself is not
+# installed globally; it comes from package-lock.json via `npm ci` into the
+# workspace's node_modules, so its version matches CI/deploy.
+#
+# GitHub's SSH host keys are baked in from the authenticated api.github.com/meta
+# (the sandbox is non-interactive, so a host-key prompt can't be answered).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl git sudo ripgrep less vim openssh-client jq && \
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y nodejs && npm i -g @anthropic-ai/claude-code && \
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && apt-get install -y --no-install-recommends gh && \
+    curl -fsSL https://api.github.com/meta -o /tmp/gh-meta.json && \
+    jq -r '.ssh_keys[] | "github.com \(.)"' /tmp/gh-meta.json > /tmp/known_hosts.gh && \
+    test -s /tmp/known_hosts.gh && \
+    cat /tmp/known_hosts.gh >> /etc/ssh/ssh_known_hosts && \
+    rm -f /tmp/gh-meta.json /tmp/known_hosts.gh && \
+    rm -rf /var/lib/apt/lists/* && \
+    (getent group ${GID} || groupadd -g ${GID} dev) && \
+    useradd -m -u ${UID} -g ${GID} -s /bin/bash dev && \
+    echo 'dev ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/dev
+
+USER dev
+WORKDIR /work

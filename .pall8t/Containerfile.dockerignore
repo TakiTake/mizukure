@@ -1,0 +1,6 @@
+# pall8t builds .pall8t/Containerfile with the project root as the build
+# context, and apple/container reads the ignore file from here (next to the
+# Containerfile), not from a root .dockerignore.
+# The Containerfile COPYs nothing, so ship nothing: keeps node_modules/ out of
+# the builder and .dev.vars (TYPESAFE_API_KEY) out of the image build.
+*

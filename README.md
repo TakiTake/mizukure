@@ -42,3 +42,16 @@ npx wrangler deploy
 ```sh
 npm test   # Workers AI と Jev をモックして API の流れを検証
 ```
+
+## AI エージェント用サンドボックス (pall8t)
+
+[pall8t](https://github.com/TakiTake/pall8t) で apple/container の VM 内でエージェントを動かせます
+(`.pall8t/Containerfile` = Node 22 + claude + gh、`hardening = "strict"`)。
+
+```sh
+pall8t run                                   # サンドボックス内で claude を起動
+pall8t run -- bash -c 'npm ci && npm test'   # テストだけ実行
+```
+
+ワークスペースはエージェントから読めるので、`.dev.vars` (TYPESAFE_API_KEY) は置かない方が安全です。
+デプロイは Workers Builds (git push) に任せ、サンドボックスには Cloudflare の認証情報を入れない想定です。
