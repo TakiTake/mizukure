@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>水やりどきチェッカー</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Zen+Maru+Gothic:wght@400;500;700;900&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#E6ECE3; --surface:#F7F9F5; --ink:#1C2B22; --muted:#5A6B60;
+  --leaf:#2F5D3A; --soil:#7A5238; --water:#2E78B7; --line:#C9D4C8; --warn:#B5542C;
+  box-sizing:border-box;
+  padding-top:env(safe-area-inset-top,0px);
+  padding-bottom:env(safe-area-inset-bottom,0px);
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#111915; --surface:#1A241E; --ink:#E3ECE5; --muted:#9AAC9F;
+    --leaf:#82B58E; --soil:#C79E7C; --water:#6FB0E8; --line:#2C3A31; --warn:#E58A62;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#111915; --surface:#1A241E; --ink:#E3ECE5; --muted:#9AAC9F;
+  --leaf:#82B58E; --soil:#C79E7C; --water:#6FB0E8; --line:#2C3A31; --warn:#E58A62;
+}
+*,*::before,*::after{box-sizing:inherit}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+body{
+  margin:0; background:var(--bg); color:var(--ink);
+  font-family:"Zen Maru Gothic","Hiragino Maru Gothic ProN","Hiragino Sans","Noto Sans JP",system-ui,sans-serif;
+  line-height:1.7; -webkit-font-smoothing:antialiased;
+}
+main{max-width:520px; margin:0 auto; padding:16px 16px 40px}
+h1{font-size:1.35rem; font-weight:900; margin:4px 0 2px; letter-spacing:.02em; color:var(--leaf)}
+.lede{margin:0 0 14px; color:var(--muted); font-size:.9rem}
+
+/* viewfinder */
+.finder{
+  position:relative; width:100%; aspect-ratio:4/5; border-radius:28px; overflow:hidden;
+  background:#0d130f; border:1px solid var(--line);
+}
+.finder video,.finder img.still{position:absolute; inset:0; width:100%; height:100%; object-fit:cover}
+.finder img.still{display:none}
+.reticle{
+  position:absolute; left:50%; top:62%; width:34%; aspect-ratio:1; transform:translate(-50%,-50%);
+  border:2px dashed rgba(255,255,255,.85); border-radius:50%; pointer-events:none;
+}
+.reticle-label{
+  position:absolute; left:50%; top:77%; transform:translateX(-50%);
+  color:#fff; font-size:.75rem; background:rgba(0,0,0,.45); padding:2px 10px; border-radius:99px; white-space:nowrap;
+}
+.live{
+  position:absolute; left:12px; right:12px; bottom:12px; padding:10px 12px;
+  background:rgba(14,22,17,.62); backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px);
+  border-radius:16px; color:#fff; font-size:.78rem;
+}
+.live-row{display:flex; justify-content:space-between; align-items:baseline; gap:8px}
+.live-bar{height:8px; border-radius:99px; margin-top:6px;
+  background:linear-gradient(90deg,#3b2a1e 0%,#7a5238 45%,#c9ad8a 100%); position:relative}
+.live-pin{position:absolute; top:-4px; width:4px; height:16px; background:#fff; border-radius:2px; left:0; transition:left .25s}
+.finder-empty{
+  position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center;
+  gap:12px; padding:24px; text-align:center; color:#dfe8e1;
+}
+.finder-empty p{margin:0; font-size:.9rem}
+
+/* controls */
+.controls{display:flex; gap:10px; margin-top:14px}
+.field{margin-top:12px}
+.field label{display:block; font-size:.82rem; color:var(--muted); margin-bottom:4px}
+.field input{
+  width:100%; font:inherit; font-size:1rem; padding:10px 14px; border-radius:14px;
+  border:1px solid var(--line); background:var(--surface); color:var(--ink);
+}
+button,.filebtn{
+  font:inherit; font-weight:700; border:0; border-radius:99px; cursor:pointer;
+  padding:14px 18px; font-size:1rem; display:inline-flex; align-items:center; justify-content:center; gap:8px;
+}
+.primary{flex:1; background:var(--leaf); color:var(--surface)}
+.primary:disabled{opacity:.5; cursor:default}
+.ghost{background:transparent; color:var(--leaf); border:1.5px solid var(--leaf)}
+.filebtn{background:var(--surface); color:var(--leaf); border:1.5px solid var(--line)}
+.filebtn input{display:none}
+button:focus-visible,.filebtn:focus-within,.field input:focus-visible{outline:3px solid var(--water); outline-offset:2px}
+
+/* result */
+.result{margin-top:18px; background:var(--surface); border-radius:28px; padding:20px; border:1px solid var(--line)}
+.result[hidden]{display:none}
+.verdict{display:flex; gap:18px; align-items:center}
+.drop{width:96px; flex:none}
+.pct{font-size:3rem; font-weight:900; line-height:1; font-variant-numeric:tabular-nums}
+.pct small{font-size:1.1rem; font-weight:700; margin-left:2px}
+.pct-label{font-size:.8rem; color:var(--muted)}
+.call{font-size:1.15rem; font-weight:900; margin:6px 0 0}
+.call.now{color:var(--warn)} .call.soon{color:var(--soil)} .call.ok{color:var(--water)}
+.meters{display:grid; gap:10px; margin:18px 0 6px}
+.meter-top{display:flex; justify-content:space-between; font-size:.85rem}
+.meter-track{height:10px; background:var(--bg); border-radius:99px; overflow:hidden; margin-top:4px}
+.meter-fill{height:100%; border-radius:99px; width:0; transition:width .6s ease}
+.reasons{margin:14px 0 0; padding-left:1.2em; font-size:.92rem}
+.reasons li{margin:4px 0}
+.advice{margin:12px 0 0; padding:12px 14px; background:var(--bg); border-radius:16px; font-size:.92rem}
+.meta{margin-top:12px; font-size:.78rem; color:var(--muted)}
+.status{margin-top:14px; font-size:.9rem; color:var(--muted); min-height:1.4em}
+.status.err{color:var(--warn)}
+.note{margin-top:22px; font-size:.78rem; color:var(--muted)}
+@media (prefers-reduced-motion: reduce){ .meter-fill,.live-pin{transition:none} .drop-water{transition:none!important} }
+</style>
+</head>
+<body>
+<main>
+  <h1>水やりどきチェッカー</h1>
+  <p class="lede">植物と土が一緒に映るように構えて、判定ボタンを押してください。</p>
+
+  <div class="finder" id="finder">
+    <video id="video" playsinline muted autoplay></video>
+    <img class="still" id="still" alt="判定に使った写真">
+    <div class="reticle" id="reticle"></div>
+    <div class="reticle-label" id="reticleLabel">ここに土を入れる</div>
+    <div class="live" id="live" hidden>
+      <div class="live-row"><span>土の色から見た乾き（リアルタイムの目安）</span><strong id="liveVal">–</strong></div>
+      <div class="live-bar"><div class="live-pin" id="livePin"></div></div>
+      <div class="live-row" style="opacity:.75;margin-top:2px"><span>湿っている</span><span>乾いている</span></div>
+    </div>
+    <div class="finder-empty" id="finderEmpty">
+      <p id="finderMsg">カメラを使うには下のボタンを押してください。</p>
+      <button class="ghost" id="startCam" style="color:#dfe8e1;border-color:#dfe8e1">カメラを起動</button>
+    </div>
+  </div>
+
+  <div class="controls">
+    <button class="primary" id="judge" disabled>この植物を判定</button>
+    <label class="filebtn" id="fileLabel">写真を選ぶ<input type="file" id="file" accept="image/jpeg,image/png,image/webp" capture="environment"></label>
+  </div>
+
+  <div class="field">
+    <label for="kind">植物の種類（任意・精度が上がります）</label>
+    <input id="kind" placeholder="例：ポトス、サンスベリア、バジル" autocomplete="off">
+  </div>
+
+  <div class="status" id="status" role="status" aria-live="polite"></div>
+
+  <section class="result" id="result" hidden aria-live="polite">
+    <div class="verdict">
+      <svg class="drop" viewBox="0 0 100 130" aria-hidden="true">
+        <defs><clipPath id="dropClip"><path d="M50 4 C50 4 8 58 8 84 a42 42 0 0 0 84 0 C92 58 50 4 50 4Z"/></clipPath></defs>
+        <path d="M50 4 C50 4 8 58 8 84 a42 42 0 0 0 84 0 C92 58 50 4 50 4Z" fill="var(--bg)"/>
+        <rect class="drop-water" id="dropWater" x="0" y="130" width="100" height="130" fill="var(--water)" clip-path="url(#dropClip)" style="transition:y .8s ease"/>
+        <path d="M50 4 C50 4 8 58 8 84 a42 42 0 0 0 84 0 C92 58 50 4 50 4Z" fill="none" stroke="var(--water)" stroke-width="3"/>
+      </svg>
+      <div>
+        <div class="pct-label">水やり必要度</div>
+        <div class="pct" id="pct">–<small>%</small></div>
+        <p class="call" id="call"></p>
+      </div>
+    </div>
+    <div class="meters">
+      <div><div class="meter-top"><span>萎れ具合</span><span id="wiltV">–</span></div>
+        <div class="meter-track"><div class="meter-fill" id="wiltF" style="background:var(--leaf)"></div></div></div>
+      <div><div class="meter-top"><span>土の乾き具合</span><span id="soilV">–</span></div>
+        <div class="meter-track"><div class="meter-fill" id="soilF" style="background:var(--soil)"></div></div></div>
+    </div>
+    <ul class="reasons" id="reasons"></ul>
+    <p class="advice" id="advice"></p>
+    <p class="meta" id="meta"></p>
+    <button class="ghost" id="again" style="margin-top:12px;width:100%">もう一度撮る</button>
+  </section>
+
+  <p class="note">判定は写真からの推定です。鉢の重さや指で土を2〜3cm触った感触と合わせて使ってください。リアルタイム表示は端末内で土の色だけを見た目安で、照明で大きく変わります。</p>
+</main>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const video=$('video'), still=$('still'), judgeBtn=$('judge'), statusEl=$('status');
+  let stream=null, sample=null, busy=false, liveTimer=null, lastLiveAt=0;
+  const work=document.createElement('canvas'); const wctx=work.getContext('2d',{willReadFrequently:true});
+
+  try{ const k=localStorage.getItem('plantKind'); if(k) $('kind').value=k; }catch(e){}
+  $('kind').addEventListener('change',()=>{ try{ localStorage.setItem('plantKind',$('kind').value.trim()); }catch(e){} });
+
+  function setStatus(t,err){ statusEl.textContent=t||''; statusEl.classList.toggle('err',!!err); }
+
+  // ---- camera ----
+  async function startCamera(){
+    if(!navigator.mediaDevices?.getUserMedia){ camFail('このブラウザではカメラを直接使えません。「写真を選ぶ」から撮影してください。'); return; }
+    try{
+      stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:1600}},audio:false});
+      video.srcObject=stream; await video.play().catch(()=>{});
+      $('finderEmpty').style.display='none'; $('live').hidden=false;
+      showLiveView(); updateJudgeBtn(); loop();
+    }catch(e){
+      camFail(e && e.name==='NotAllowedError'
+        ? 'カメラの使用が許可されませんでした。「写真を選ぶ」から撮影して判定できます。'
+        : 'カメラを起動できませんでした。「写真を選ぶ」から撮影して判定できます。');
+    }
+  }
+  function camFail(msg){ $('finderMsg').textContent=msg; $('startCam').style.display='none'; }
+  $('startCam').onclick=startCamera;
+
+  function showLiveView(){ still.style.display='none'; video.style.display='block'; $('reticle').style.display=''; $('reticleLabel').style.display=''; if(stream) $('live').hidden=false; }
+  function showStill(url){ still.src=url; still.style.display='block'; video.style.display='none'; $('reticle').style.display='none'; $('reticleLabel').style.display='none'; $('live').hidden=true; $('finderEmpty').style.display='none'; }
+
+  // ---- on-device live soil tone (runs locally, no Claude calls) ----
+  function loop(){
+    liveTimer=requestAnimationFrame(loop);
+    const now=performance.now(); if(now-lastLiveAt<250 || !video.videoWidth || video.style.display==='none') return; lastLiveAt=now;
+    const vw=video.videoWidth, vh=video.videoHeight;
+    // map reticle (center at 50%,62% of the cover-fitted box) back to video pixels
+    const box=$('finder').getBoundingClientRect();
+    const scale=Math.max(box.width/vw, box.height/vh);
+    const dispW=vw*scale, dispH=vh*scale, offX=(dispW-box.width)/2, offY=(dispH-box.height)/2;
+    const r=(box.width*0.34/2)/scale;
+    const cx=(box.width*0.5+offX)/scale, cy=(box.height*0.62+offY)/scale;
+    const s=48; work.width=s; work.height=s;
+    wctx.drawImage(video, cx-r*0.7, cy-r*0.7, r*1.4, r*1.4, 0,0,s,s);
+    const d=wctx.getImageData(0,0,s,s).data;
+    let L=0,S=0,n=0;
+    for(let i=0;i<d.length;i+=4){
+      const R=d[i]/255,G=d[i+1]/255,B=d[i+2]/255;
+      const mx=Math.max(R,G,B), mn=Math.min(R,G,B), l=(mx+mn)/2;
+      if(G>R*1.15 && G>B*1.1) continue; // skip leaves
+      const sat = mx===mn?0:(l>0.5?(mx-mn)/(2-mx-mn):(mx-mn)/(mx+mn));
+      L+=l; S+=sat; n++;
+    }
+    if(n<s*s*0.25){ $('liveVal').textContent='土が見えません'; return; }
+    L/=n; S/=n;
+    // dry soil: lighter and greyer. Crude, lighting-dependent.
+    let dry=(L-0.16)/(0.50-0.16) + (0.35-S)*0.4;
+    dry=Math.max(0,Math.min(1,dry));
+    $('liveVal').textContent=Math.round(dry*100)+'%';
+    $('livePin').style.left=`calc(${(dry*100).toFixed(1)}% - 2px)`;
+  }
+
+  // ---- Claude ----
+  (async()=>{
+    sample=await claude.use('sample').catch(()=>null);
+    if(sample){
+      const lim=await sample.limits().catch(()=>null);
+      if(!lim?.images){ sample=null; setStatus('この画面では画像判定を使えません。claude.ai のアプリかブラウザで開いてください。',true); }
+    }else{
+      setStatus('判定機能に接続できません。claude.ai 上でこのページを開いてください。',true);
+    }
+    updateJudgeBtn();
+  })();
+
+  function updateJudgeBtn(){ judgeBtn.disabled = busy || !sample || !stream; $('file').disabled = busy || !sample; }
+
+  function captureFrame(){
+    return new Promise((res,rej)=>{
+      const vw=video.videoWidth, vh=video.videoHeight; if(!vw) return rej(new Error('no frame'));
+      const max=1280, k=Math.min(1,max/Math.max(vw,vh));
+      const c=document.createElement('canvas'); c.width=Math.round(vw*k); c.height=Math.round(vh*k);
+      c.getContext('2d').drawImage(video,0,0,c.width,c.height);
+      c.toBlob(b=>b?res(b):rej(new Error('blob')),'image/jpeg',0.85);
+    });
+  }
+
+  function buildPrompt(){
+    const kind=$('kind').value.trim();
+    return `あなたは園芸の専門家です。添付の写真は鉢植えまたは地植えの植物です。写真から「今水やりが必要か」を判定してください。
+${kind?`ユーザーによる植物の種類: ${kind.slice(0,60)}`:'植物の種類は不明なので、写真から推定してください。'}
+
+見るポイント:
+- 葉や茎の萎れ・垂れ下がり・張りの無さ・縁の丸まりや乾燥（wilting）
+- 土の表面の色（明るく白っぽい＝乾燥、暗い＝湿潤）、ひび割れ、鉢との隙間（soil_dryness）
+- 植物の種類ごとの水の好み（多肉植物やサンスベリアは乾かし気味で良い等）
+- 水のやりすぎのサイン（黄変、常に濡れた暗い土）があれば need_percent を下げ、reasons に書く
+
+次のJSONだけを返してください（日本語、説明文なし）:
+{"need_percent":0-100の整数,"verdict":"now"|"soon"|"not_needed"|"unclear","wilting":0-100,"soil_dryness":0-100,"plant_guess":"推定した植物名","reasons":["根拠を短く最大3つ"],"advice":"具体的な一言アドバイス","confidence":0から1の数値,"plant_visible":true/false,"soil_visible":true/false}
+植物や土が写っていない・不鮮明な場合は verdict を "unclear" にし、advice に撮り直し方を書いてください。`;
+  }
+
+  async function judge(blob){
+    if(busy||!sample) return;
+    busy=true; updateJudgeBtn(); setStatus('判定中…（初回は利用の許可を求められます）');
+    try{
+      const r=await sample.json(buildPrompt(),{images:blob, modelTier:'quick'});
+      render(r); setStatus('');
+    }catch(e){
+      const code=e&&e.code;
+      const msg={
+        not_granted:'Claudeの利用が許可されなかったため判定できません。',
+        sampling_disabled:'このアカウントでは判定機能を使えません。',
+        rate_limited:'判定の回数が多すぎます。少し時間をおいてから試してください。',
+        image_rejected:'この画像は使えません。JPEG・PNG・WebP の写真で試してください。',
+        invalid_json:'判定結果を読み取れませんでした。もう一度判定してください。',
+        refused:'この写真では判定できませんでした。植物と土を写して撮り直してください。',
+        session_expired:'claude.ai に再ログインしてください。',
+        images_unavailable:'この画面では画像判定を使えません。'
+      }[code]||'通信に失敗しました。もう一度判定してください。';
+      setStatus(msg,true);
+      if(['not_granted','sampling_disabled','images_unavailable'].includes(code)) sample=null;
+    }finally{ busy=false; updateJudgeBtn(); }
+  }
+
+  function clamp(v){ v=Number(v); return isFinite(v)?Math.max(0,Math.min(100,Math.round(v))):null; }
+
+  function render(r){
+    r=r||{};
+    const need=clamp(r.need_percent), wilt=clamp(r.wilting), soil=clamp(r.soil_dryness);
+    const unclear = r.verdict==='unclear' || need===null;
+    $('result').hidden=false;
+    $('pct').firstChild.nodeValue = unclear?'–':String(need);
+    $('dropWater').setAttribute('y', unclear?130:String(4+ (need/100)*122));
+    const call=$('call'); call.className='call';
+    if(unclear){ call.textContent='うまく判定できませんでした'; }
+    else if(r.verdict==='now'||need>=70){ call.textContent='今日、水をあげましょう'; call.classList.add('now'); }
+    else if(r.verdict==='soon'||need>=40){ call.textContent='あと少し待って大丈夫'; call.classList.add('soon'); }
+    else { call.textContent='まだ水やりは不要です'; call.classList.add('ok'); }
+    $('wiltV').textContent = wilt===null?'–':wilt+'%'; $('wiltF').style.width=(wilt||0)+'%';
+    $('soilV').textContent = soil===null?'–':soil+'%'; $('soilF').style.width=(soil||0)+'%';
+    const ul=$('reasons'); ul.replaceChildren();
+    (Array.isArray(r.reasons)?r.reasons:[]).slice(0,3).forEach(t=>{ const li=document.createElement('li'); li.textContent=String(t); ul.append(li); });
+    $('advice').textContent = r.advice?String(r.advice):'';
+    $('advice').hidden=!r.advice;
+    const conf = Number(r.confidence);
+    const bits=[];
+    if(r.plant_guess) bits.push('推定：'+String(r.plant_guess));
+    if(isFinite(conf)) bits.push('確信度 '+Math.round(Math.max(0,Math.min(1,conf))*100)+'%');
+    if(r.soil_visible===false) bits.push('土が写っていないため土の判定は参考値です');
+    $('meta').textContent=bits.join('／');
+    $('result').scrollIntoView({behavior: matchMedia('(prefers-reduced-motion: reduce)').matches?'auto':'smooth', block:'start'});
+  }
+
+  judgeBtn.onclick=async()=>{
+    try{ const b=await captureFrame(); showStill(URL.createObjectURL(b)); await judge(b); }
+    catch(e){ setStatus('カメラの映像を取得できませんでした。',true); }
+  };
+  $('file').onchange=async e=>{
+    const f=e.target.files&&e.target.files[0]; e.target.value='';
+    if(!f) return; showStill(URL.createObjectURL(f)); await judge(f);
+  };
+  $('again').onclick=()=>{
+    $('result').hidden=true; setStatus('');
+    if(stream){ showLiveView(); window.scrollTo({top:0,behavior:'smooth'}); }
+    else { $('file').click(); }
+  };
+
+  // try to start the camera right away; the viewer may still need to tap
+  startCamera();
+})();
+</script>
+</body>
+</html>
