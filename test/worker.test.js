@@ -87,7 +87,7 @@ function mockFetch(t, handler, { turnstile = { success: true, hostname: 'mizukur
 test('full flow: vision → Jev → page result', async (t) => {
   const env = makeEnv();
   const jev = mockFetch(t, () => Response.json(jevAnswer(3.1)));
-  const res = await worker.fetch(judgeRequest({ kind: 'ポトス', device_soil: JSON.stringify({ dry: 0.66, L: 0.41, S: 0.2 }) }), env);
+  const res = await worker.fetch(judgeRequest({ kind: 'ポトス' }), env);
   assert.equal(res.status, 200);
   const r = await res.json();
   assert.equal(r.need_percent, 78);          // 3.1 / 4
@@ -109,7 +109,7 @@ test('full flow: vision → Jev → page result', async (t) => {
   assert.equal(body.model, 'jev-latest');
   assert.deepEqual(Object.keys(body.questions), Object.keys(QUESTIONS));
   assert.equal(body.state.owner_says_plant_is, 'ポトス');
-  assert.equal(body.state.on_device_soil_colour_measurement.estimated_dryness_percent, 66);
+  assert.equal(body.state.on_device_soil_colour_measurement, undefined);
 });
 
 test('retries Jev on 429 then succeeds', async (t) => {
@@ -570,7 +570,28 @@ test('a judgement is stored after the response (inputs, answers, result, timings
   assert.equal(JSON.parse(row.result).verdict, 'now');
   assert.deepEqual(Object.keys(JSON.parse(row.ms)), ['turnstile', 'upload', 'vision', 'jev', 'total']);
   assert.equal(row.vote, null);
+  assert.equal(row.device_soil, null);            // the page sent no colour reading
   assert.ok(Math.abs(row.created_at - Date.now()) < 5000);
+});
+
+test('the phone\'s soil colour reading is stored for calibration but not given to Jev', async (t) => {
+  const db = sqliteD1();
+  const jev = mockFetch(t, () => Response.json(jevAnswer(1)));
+  const ctx = makeCtx();
+  const reading = { dry: 1.4, L: 0.5123, S: 0.2, R: 0.6, G: 0.5, B: -0.1, frac: 0.8, extra: 'dropped' };
+  await worker.fetch(judgeRequest({ device_soil: JSON.stringify(reading) }), { ...makeEnv(), DB: db }, ctx);
+  await ctx.settle();
+  assert.doesNotMatch(JSON.stringify(jev.seen[0].body.state), /soil_colour|device/);
+  // clamped to 0..1, rounded, unknown keys dropped
+  assert.deepEqual(JSON.parse(rows(db)[0].device_soil), { dry: 1, L: 0.512, S: 0.2, R: 0.6, G: 0.5, B: 0, frac: 0.8 });
+
+  // an unusable reading (no `dry`, or not JSON) is stored as null
+  for (const bad of ['{"L":0.5}', '{"dry":null}', '{"dry":"0.5"}', '{"dry":[0.5]}', 'not json', 'null']) {
+    const d2 = sqliteD1(), c2 = makeCtx();
+    await worker.fetch(judgeRequest({ device_soil: bad }), { ...makeEnv(), DB: d2 }, c2);
+    await c2.settle();
+    assert.equal(rows(d2)[0].device_soil, null, bad);
+  }
 });
 
 test('an unclear photo (Jev skipped) is stored too, with no answers', async (t) => {
