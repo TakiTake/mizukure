@@ -20,6 +20,12 @@
     { "name": "JUDGE_LIMITER", "namespace_id": "1001", "simple": { "limit": 10, "period": 60 } }
   ],
 
+  // Judgements + 👍/👎 feedback (optional; without it judging still works). The table is created by the Worker on
+  // first use. Forks: create your own D1 database and put its ID here (see README).
+  "d1_databases": [
+    { "binding": "DB", "database_name": "mizukure", "database_id": "aecc7b60-dc87-4e37-a762-d86a3520b0ce" }
+  ],
+
   "vars": {
     "VISION_MODEL": "@cf/meta/llama-4-scout-17b-16e-instruct",
     "JEV_MODEL": "jev-latest"

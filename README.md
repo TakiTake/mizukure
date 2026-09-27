@@ -8,7 +8,9 @@
 ```
 スマホ (カメラ) → public/index.html → POST /api/judge (src/worker.js)
                                         ├─ 1. Workers AI 視覚モデル: 写真 → 英語の観察メモ(JSON)
-                                        └─ 2. Jev (typesafe.ai /v1/systemone): 観察メモ → 確率付き判定
+                                        ├─ 2. Jev (typesafe.ai /v1/systemone): 観察メモ → 確率付き判定
+                                        └─ 3. D1: 判定の記録 (写真は保存しない)
+                    POST /api/feedback ──── 判定への 👍/👎 と、👎 のときの「指で触った結果」を記録
 ```
 
 Jev はテキスト専用 (画像入力非対応) のため、写真はまず Workers AI の視覚モデルで観察メモに変換してから Jev に渡します。
@@ -36,6 +38,7 @@ Jev に聞いている質問 (`src/worker.js` の `QUESTIONS`):
 | GitHub アカウント | このリポジトリを fork し、Cloudflare に接続する | 無料 |
 | Cloudflare アカウント | Worker (API + 静的ページ)、Workers AI、Turnstile | Workers AI は 1 日 10,000 Neurons まで無料。超える分を使うには Workers Paid プラン (月 $5〜) が必要 |
 | typesafe.ai の API キー | Jev (判定モデル) の呼び出し | typesafe.ai の料金体系に従います |
+| (Cloudflare D1) | 判定とフィードバックの記録 | Free プランは 1 日 10 万行の書き込みまで無料 (判定・フィードバック 1 回あたり、索引の更新を含めて数行)。超えると記録とフィードバックだけが止まり、判定は続けられる |
 
 > **課金について**: 判定 1 回ごとに Workers AI (画像解析) と Jev が 1 回ずつ呼ばれます。
 > カメラのリアルタイム表示 (土の色) は端末内だけで計算するので、何回見ても料金はかかりません。
@@ -46,6 +49,16 @@ Jev に聞いている質問 (`src/worker.js` の `QUESTIONS`):
 GitHub でこのリポジトリを fork します。Worker の名前は `wrangler.jsonc` の `"name"` (既定は `mizukure`) で決まります。
 別の名前にしたい場合は、ここで `"name"` を書き換えてコミットしておいてください
 (**ダッシュボード上の Worker 名と一致していないと、ビルドが失敗します**)。
+
+続けて、判定を記録する D1 データベースを自分のアカウントに作ります。
+`wrangler.jsonc` の `database_id` はこのリポジトリの作者のデータベースを指しているので、そのままではビルドが失敗します。
+
+1. ダッシュボードの **Storage & databases** → **D1 SQL database** → **Create Database**。名前は `mizukure` (任意)
+2. 作成後に表示される **Database ID** を、`wrangler.jsonc` の `d1_databases` の `database_id` に書き換えてコミット
+   (名前を変えた場合は `database_name` も合わせる)
+
+テーブルは最初の判定のときに Worker が自動で作るので、SQL を実行する必要はありません。
+記録が不要なら、`wrangler.jsonc` から `d1_databases` を丸ごと消しても判定は動きます (フィードバックのボタンが出なくなります)。
 
 ### 2. workers.dev のサブドメインを確認する
 
@@ -130,12 +143,12 @@ npx wrangler deploy        # Workers Builds を使わない場合のみ
 1. `https://<Worker 名>.<サブドメイン>.workers.dev/api/health` を開き、すべて `true` になっていることを確認します。
 
    ```json
-   {"ok":true,"jev":true,"ai":true,"turnstile":true,"rate_limit":true}
+   {"ok":true,"jev":true,"ai":true,"turnstile":true,"rate_limit":true,"db":true}
    ```
 
    `ok` は判定に必要な設定がすべて揃っているときだけ `true` です。
    `false` の項目があれば、その設定が足りていません (`jev` → `TYPESAFE_API_KEY`、`turnstile` → Turnstile の 2 つ、
-   `ai` / `rate_limit` → `wrangler.jsonc` のバインディング)。
+   `ai` / `rate_limit` / `db` → `wrangler.jsonc` のバインディング)。`db` は任意で、`ok` には影響しません。
 2. スマホでトップページを開き、カメラを許可して植物と土を写し、「この植物を判定」を押します。
 
 ### 7. (任意) 調整できる設定
@@ -183,6 +196,43 @@ Cloudflare の拠点ごとの概算で、アカウント全体の利用上限で
 ページ側では、判定中はボタンを無効にして二重送信を防いでいます。Turnstile のトークンはページを開いたとき・各判定の後・タブに戻ったときに先に取得しておき (有効期限 300 秒のため、4 分を過ぎたものは取り直します)、判定時の待ち時間を減らしています。Turnstile がチェックボックスを
 出した場合 (まれです) は、画面にその旨を表示してチェックボックスまでスクロールします。
 
+## 判定の記録とフィードバック (D1)
+
+判定のたびに、次の内容を D1 の `judgements` テーブルに 1 行保存します。**写真と IP アドレスは保存しません。**
+
+| 列 | 内容 |
+|---|---|
+| `id` | 判定 ID (ランダムな UUID)。ページに返し、フィードバックのときに使う |
+| `created_at` / `feedback_at` | 判定の日時・最後のフィードバックの日時 (UNIX ミリ秒) |
+| `pipeline` / `models` | 判定の方式 (`vision+jev`) と使ったモデル |
+| `inputs` | Jev に渡した内容 (視覚モデルの観察メモ、植物の種類の入力、端末で測った土の色) |
+| `answers` / `result` | Jev の回答と、画面に出した結果 |
+| `ms` | 各段階の所要時間 |
+| `vote` | 👍 `good` / 👎 `bad` |
+| `actual` | 👎 のあとに聞く「指で土を触った結果」: `dry` (乾いていた) / `moist` (湿っていた) |
+
+保存は応答を返したあとに行うので、判定の速さには影響しません (保存に失敗しても判定結果は表示されます)。
+フィードバックは 1 つの判定につき投票 1 回と、👎 のときの `actual` 1 回だけ、判定から 1 日以内に受け付けます
+(同じ内容の再送は成功扱い、違う内容への変更は不可)。
+ページ下部の注意書きで、判定の内容を保存していることを判定前から表示しています。
+
+自動で消す仕組みはなく、記録は残り続けます。古い記録を消すときは、たとえば次のように実行します (90 日より前を削除)。
+
+```sh
+npx wrangler d1 execute mizukure --remote --command "DELETE FROM judgements WHERE created_at < (unixepoch() - 90*86400) * 1000"
+```
+
+`/api/feedback` は Origin チェックと、判定と共通のゆるいレート制限 (`PRECHECK_LIMITER`) で守っています
+(判定 ID はランダムで推測できず、有料 API も呼ばないため Turnstile は使いません)。
+
+集計はダッシュボードの D1 → **Console**、または CLI で行えます。
+
+```sh
+npx wrangler d1 execute mizukure --remote --command "
+  SELECT json_extract(result, '$.verdict') AS verdict, vote, actual, COUNT(*) AS n
+  FROM judgements WHERE vote IS NOT NULL GROUP BY 1, 2, 3 ORDER BY 1, 2, 3"
+```
+
 ## ローカル開発
 
 ```sh
@@ -203,6 +253,7 @@ npm run dev            # http://localhost:8787
 ```
 
 - Workers AI と Jev はローカルでも実際に呼ばれ、**課金対象**です。
+- D1 はローカルの SQLite (`.wrangler/state/`) が使われ、本番のデータベースには書き込みません。
 - テスト用キーは `localhost` / `127.0.0.1` / `[::1]` からのアクセスでのみ通ります
   (同じ LAN のスマホから `http://192.168.x.x:8787` で開いた場合は Turnstile が失敗します)。
   **本番のシークレットにテスト用キーを設定しないでください** (本番では常に失敗し、判定できなくなります)。
@@ -248,7 +299,7 @@ npm run dev            # http://localhost:8787
 ## テスト
 
 ```sh
-npm test   # Workers AI・Jev・Turnstile・レート制限をモックして API の流れを検証
+npm test   # Workers AI・Jev・Turnstile・レート制限をモックして API の流れを検証 (D1 は node:sqlite で実際の SQL を実行)
 ```
 
 ## AI エージェント用サンドボックス (pall8t)

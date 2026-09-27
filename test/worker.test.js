@@ -1,8 +1,10 @@
 // Runs with: npm test
 // Mocks Workers AI, the rate limiter, Turnstile and the Jev API, so no keys or network are needed.
+// D1 is a thin adapter over an in-memory node:sqlite database, so the real SQL runs.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import worker, { extractJson, toResult, rateLimitKey, QUESTIONS, SITEVERIFY_TIMEOUT_MS } from '../src/worker.js';
+import { DatabaseSync } from 'node:sqlite';
+import worker, { extractJson, toResult, rateLimitKey, QUESTIONS, SITEVERIFY_TIMEOUT_MS, FEEDBACK_WINDOW_MS } from '../src/worker.js';
 
 const OBS = {
   plant_visible: true, soil_visible: true, image_quality: 'good',
@@ -476,13 +478,18 @@ test('/api/health reports the Turnstile and rate-limit config', async (t) => {
   const env = makeEnv();
   delete env.TURNSTILE_SECRET;
   const r = await (await worker.fetch(new Request(`${SELF}/api/health`), env)).json();
-  assert.deepEqual(r, { ok: false, jev: true, ai: true, turnstile: false, rate_limit: true });
+  assert.deepEqual(r, { ok: false, jev: true, ai: true, turnstile: false, rate_limit: true, db: false });
   assert.equal((await (await worker.fetch(new Request(`${SELF}/api/health`), makeEnv())).json()).ok, true);
 
   const env2 = makeEnv();
   delete env2.PRECHECK_LIMITER;
   const r2 = await (await worker.fetch(new Request(`${SELF}/api/health`), env2)).json();
   assert.equal(r2.rate_limit, false);
+
+  // D1 is optional: reported, but `ok` doesn't depend on it
+  const r3 = await (await worker.fetch(new Request(`${SELF}/api/health`), { ...makeEnv(), DB: sqliteD1() })).json();
+  assert.equal(r3.db, true);
+  assert.equal(r3.ok, true);
 });
 
 test('/api/config exposes the public Turnstile site key and the photo size limit', async (t) => {
@@ -493,4 +500,169 @@ test('/api/config exposes the public Turnstile site key and the photo size limit
 test('non-API paths are served from static assets', async (t) => {
   const res = await worker.fetch(new Request('https://x.dev/'), makeEnv());
   assert.equal(await res.text(), 'asset');
+});
+
+// ---------------------------------------------------------------- judgement log + feedback (D1)
+
+// The subset of the D1 API the Worker uses (prepare/bind, batch as one transaction), on real SQLite.
+function sqliteD1({ failBatch = false } = {}) {
+  const raw = new DatabaseSync(':memory:');
+  const statement = (sql, args = []) => ({ sql, args, bind: (...a) => statement(sql, a) });
+  return {
+    raw,
+    prepare: sql => statement(sql),
+    async batch(stmts) {
+      if (failBatch) throw new Error('D1 unavailable');
+      raw.exec('BEGIN');
+      try {
+        const out = stmts.map(st => ({ meta: { changes: Number(raw.prepare(st.sql).run(...st.args).changes) } }));
+        raw.exec('COMMIT');
+        return out;
+      } catch (e) { raw.exec('ROLLBACK'); throw e; }
+    },
+  };
+}
+
+function makeCtx() {
+  const pending = [];
+  return { waitUntil: p => pending.push(p), settle: () => Promise.all(pending), pending };
+}
+
+const rows = db => db.raw.prepare('SELECT * FROM judgements').all();
+
+// Judges once with a DB and returns the stored id.
+async function judgeAndStore(t, db) {
+  mockFetch(t, () => Response.json(jevAnswer(3.1)));
+  const ctx = makeCtx();
+  const r = await (await worker.fetch(judgeRequest({ kind: 'ポトス' }), { ...makeEnv(), DB: db }, ctx)).json();
+  await ctx.settle();
+  return r.judgement_id;
+}
+
+function feedback(body, headers = {}) {
+  return new Request(`${SELF}/api/feedback`, {
+    method: 'POST', body: typeof body === 'string' ? body : JSON.stringify(body),
+    headers: { Origin: SELF, 'CF-Connecting-IP': '203.0.113.7', 'Content-Type': 'application/json', ...headers },
+  });
+}
+const sendFeedback = async (db, body, headers) => {
+  const res = await worker.fetch(feedback(body, headers), { ...makeEnv(), DB: db });
+  return { status: res.status, body: await res.json() };
+};
+
+test('a judgement is stored after the response (inputs, answers, result, timings), and its id is returned', async (t) => {
+  t.mock.method(console, 'log', () => {});
+  const db = sqliteD1();
+  mockFetch(t, () => Response.json(jevAnswer(3.1)));
+  const ctx = makeCtx();
+  const res = await worker.fetch(judgeRequest({ kind: 'ポトス' }), { ...makeEnv(), DB: db }, ctx);
+  const r = await res.json();
+  assert.match(r.judgement_id, /^[0-9a-f-]{36}$/);
+  assert.equal(ctx.pending.length, 1);          // written in waitUntil, not before responding
+  await ctx.settle();
+
+  const [row] = rows(db);
+  assert.equal(row.id, r.judgement_id);
+  assert.equal(row.pipeline, 'vision+jev');
+  assert.deepEqual(JSON.parse(row.models), { vision: '@cf/meta/llama-4-scout-17b-16e-instruct', jev: 'jev-1.13.0' });
+  assert.equal(JSON.parse(row.inputs).owner_says_plant_is, 'ポトス');
+  assert.equal(JSON.parse(row.answers).watering_need.score, 3.1);
+  assert.equal(JSON.parse(row.result).verdict, 'now');
+  assert.deepEqual(Object.keys(JSON.parse(row.ms)), ['turnstile', 'upload', 'vision', 'jev', 'total']);
+  assert.equal(row.vote, null);
+  assert.ok(Math.abs(row.created_at - Date.now()) < 5000);
+});
+
+test('an unclear photo (Jev skipped) is stored too, with no answers', async (t) => {
+  const db = sqliteD1();
+  mockFetch(t, noJev);
+  const ctx = makeCtx();
+  const env = { ...makeEnv({ obs: { ...OBS, plant_visible: false, soil_visible: false } }), DB: db };
+  const r = await (await worker.fetch(judgeRequest(), env, ctx)).json();
+  await ctx.settle();
+  const [row] = rows(db);
+  assert.equal(row.id, r.judgement_id);
+  assert.equal(row.answers, null);
+  assert.equal(JSON.parse(row.result).verdict, 'unclear');
+  assert.deepEqual(JSON.parse(row.models), { vision: '@cf/meta/llama-4-scout-17b-16e-instruct' });
+});
+
+test('without a DB nothing is stored and no id is returned; a failed write still returns the verdict', async (t) => {
+  mockFetch(t, () => Response.json(jevAnswer(3.1)));
+  const ctx = makeCtx();
+  const r = await (await worker.fetch(judgeRequest(), makeEnv(), ctx)).json();
+  assert.equal(r.judgement_id, undefined);
+  assert.equal(ctx.pending.length, 0);
+
+  const errors = t.mock.method(console, 'error', () => {});
+  const ctx2 = makeCtx();
+  const res = await worker.fetch(judgeRequest(), { ...makeEnv(), DB: sqliteD1({ failBatch: true }) }, ctx2);
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).verdict, 'now');
+  await ctx2.settle();                          // the failure is caught and logged, not thrown
+  assert.match(String(errors.mock.calls[0].arguments[0]), /saving judgement failed/);
+});
+
+test('feedback: one vote per judgement; after 👎 one finger-test answer; resending the same answer succeeds', async (t) => {
+  const db = sqliteD1();
+  const good = await judgeAndStore(t, db);
+  assert.deepEqual(await sendFeedback(db, { id: good, vote: 'good' }), { status: 200, body: { ok: true } });
+  assert.equal((await sendFeedback(db, { id: good, vote: 'good' })).status, 200);     // a retry after a lost response
+  assert.equal((await sendFeedback(db, { id: good, vote: 'bad' })).status, 404);      // no changing the vote
+  assert.equal((await sendFeedback(db, { id: good, actual: 'dry' })).status, 404);    // no 👎, no follow-up
+
+  const bad = await judgeAndStore(t, db);
+  assert.equal((await sendFeedback(db, { id: bad, actual: 'dry' })).status, 404);     // follow-up before the vote
+  assert.equal((await sendFeedback(db, { id: bad, vote: 'bad' })).status, 200);
+  assert.equal((await sendFeedback(db, { id: bad, vote: 'bad' })).status, 200);       // retried 👎 still leads on
+  assert.equal((await sendFeedback(db, { id: bad, actual: 'moist' })).status, 200);
+  assert.equal((await sendFeedback(db, { id: bad, actual: 'moist' })).status, 200);
+  assert.equal((await sendFeedback(db, { id: bad, actual: 'dry' })).status, 404);     // no changing the answer
+
+  const byId = Object.fromEntries(rows(db).map(r => [r.id, r]));
+  assert.equal(byId[good].vote, 'good');
+  assert.equal(byId[good].actual, null);
+  assert.equal(byId[bad].vote, 'bad');
+  assert.equal(byId[bad].actual, 'moist');
+  assert.ok(byId[bad].feedback_at >= byId[bad].created_at);
+});
+
+test('feedback: unknown or expired judgements → 404', async (t) => {
+  const db = sqliteD1();
+  const id = await judgeAndStore(t, db);
+  assert.equal((await sendFeedback(db, { id: crypto.randomUUID(), vote: 'good' })).status, 404);
+  db.raw.prepare('UPDATE judgements SET created_at = ? WHERE id = ?').run(Date.now() - FEEDBACK_WINDOW_MS - 1000, id);
+  assert.equal((await sendFeedback(db, { id, vote: 'good' })).status, 404);
+
+  // a DB where nothing was ever judged (no table yet) answers 404 too, not an error
+  assert.equal((await sendFeedback(sqliteD1(), { id, vote: 'good' })).status, 404);
+});
+
+test('feedback: malformed requests are refused before touching the DB', async (t) => {
+  const db = sqliteD1();
+  const id = await judgeAndStore(t, db);
+  for (const body of [
+    { id: 'not-a-uuid', vote: 'good' }, { id, vote: 'meh' }, { id, actual: 'wet' }, { id, vote: 'bad', actual: 'dry' },
+    { id }, { vote: 'good' }, [id], 'not json', 'null',
+  ]) {
+    const r = await sendFeedback(db, body);
+    assert.deepEqual(r, { status: 400, body: { error: 'bad_request' } }, JSON.stringify(body));
+  }
+  assert.equal((await sendFeedback(db, { id, vote: 'good', pad: 'x'.repeat(2000) })).status, 413);
+  assert.equal((await sendFeedback(db, { id, vote: 'good' }, { Origin: 'https://evil.example' })).status, 403);
+  assert.equal(rows(db)[0].vote, null);
+});
+
+test('feedback: no DB → not_configured; D1 down → 503 storage_unavailable; rate limited → 429; GET → 405', async (t) => {
+  const id = crypto.randomUUID();
+  const noDb = await worker.fetch(feedback({ id, vote: 'good' }), makeEnv());
+  assert.deepEqual([noDb.status, (await noDb.json()).error], [500, 'not_configured']);
+
+  t.mock.method(console, 'error', () => {});
+  assert.deepEqual(await sendFeedback(sqliteD1({ failBatch: true }), { id, vote: 'good' }), { status: 503, body: { error: 'storage_unavailable' } });
+
+  const limitedRes = await worker.fetch(feedback({ id, vote: 'good' }), { ...makeEnv({ allowPrecheck: false }), DB: sqliteD1() });
+  assert.equal(limitedRes.status, 429);
+
+  assert.equal((await worker.fetch(new Request(`${SELF}/api/feedback`), makeEnv())).status, 405);
 });

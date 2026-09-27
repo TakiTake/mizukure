@@ -103,6 +103,13 @@ button:focus-visible,.filebtn:focus-within,.field input:focus-visible{outline:3p
 .reasons li{margin:4px 0}
 .advice{margin:12px 0 0; padding:12px 14px; background:var(--bg); border-radius:16px; font-size:.92rem}
 .meta{margin-top:12px; font-size:.78rem; color:var(--muted)}
+.fb{margin-top:16px; padding-top:14px; border-top:1px solid var(--line)}
+.fb[hidden],.fb-row[hidden]{display:none}
+.fb-q{margin:0 0 10px; font-weight:700; font-size:.95rem}
+.fb-row{display:flex; gap:8px}
+.fb-row button{flex:1; padding:10px 12px; font-size:.92rem}
+.fb-row button:disabled{opacity:.5; cursor:default}
+.fb-note{margin:10px 0 0; font-size:.72rem; color:var(--muted)}
 .status{margin-top:14px; font-size:.9rem; color:var(--muted); min-height:1.4em}
 .status.err{color:var(--warn)}
 .note{margin-top:22px; font-size:.78rem; color:var(--muted)}
@@ -166,10 +173,22 @@ button:focus-visible,.filebtn:focus-within,.field input:focus-visible{outline:3p
     <ul class="reasons" id="reasons"></ul>
     <p class="advice" id="advice"></p>
     <p class="meta" id="meta"></p>
+    <div class="fb" id="fb" hidden>
+      <p class="fb-q" id="fbQ" aria-live="polite"></p>
+      <div class="fb-row" id="fbVote">
+        <button class="ghost" data-vote="good">👍 合っていた</button>
+        <button class="ghost" data-vote="bad">👎 違っていた</button>
+      </div>
+      <div class="fb-row" id="fbActual" hidden>
+        <button class="ghost" data-actual="dry">乾いていた</button>
+        <button class="ghost" data-actual="moist">湿っていた</button>
+      </div>
+      <p class="fb-note">判定の内容（写真は含みません）は、精度の改善のために保存しています。</p>
+    </div>
     <button class="ghost" id="again" style="margin-top:12px;width:100%">もう一度撮る</button>
   </section>
 
-  <p class="note">判定は写真をAIが観察し、その内容を Jev（typesafe.ai）が評価した推定です。鉢の重さや指で土を2〜3cm触った感触と合わせて使ってください。リアルタイム表示は端末内で土の色だけを見た目安で、照明で大きく変わります。</p>
+  <p class="note">判定は写真をAIが観察し、その内容を Jev（typesafe.ai）が評価した推定です。鉢の重さや指で土を2〜3cm触った感触と合わせて使ってください。リアルタイム表示は端末内で土の色だけを見た目安で、照明で大きく変わります。判定の内容（AIによる写真の観察メモ、植物の種類の入力、端末で測った土の色、判定結果。写真そのものとIPアドレスは含みません）は、精度の改善のために保存しています。</p>
 </main>
 
 <script>
@@ -403,8 +422,50 @@ button:focus-visible,.filebtn:focus-within,.field input:focus-visible{outline:3p
     if(isFinite(conf)) bits.push('確信度 '+Math.round(Math.max(0,Math.min(1,conf))*100)+'%');
     if(r.soil_visible===false) bits.push('土が写っていないため土の判定は参考値です');
     $('meta').textContent=bits.join('／');
+    showFeedback(r);
     $('result').scrollIntoView({behavior: matchMedia('(prefers-reduced-motion: reduce)').matches?'auto':'smooth', block:'start'});
   }
+
+  // ---- feedback on the verdict (stored with the judgement; 👎 asks what the finger test found) ----
+  let fbId=null;
+  const ASK='この判定は合っていましたか？', FINGER='指で土を2〜3cm触ってみてください。実際はどうでしたか？';
+  const THANKS='ありがとうございます！判定の改善に使わせていただきます。', GONE='この判定にはもう回答できません。';
+  const DOWN='今は送信できません。ありがとうございました。', RETRY='送信できませんでした。もう一度押してください。';
+
+  // Shows `q` with the buttons of `step` ('vote' | 'actual' | none). `only` limits a retry to the answer already
+  // sent: it may have been stored although its response was lost, and the server keeps the first answer.
+  function fbState(q, step, only){
+    $('fbQ').textContent=q; $('fbVote').hidden=step!=='vote'; $('fbActual').hidden=step!=='actual';
+    $('fb').querySelectorAll('button').forEach(b=>{ b.disabled = !!only && b.dataset[step]!==only; });
+  }
+  function showFeedback(r){
+    fbId = r.verdict!=='unclear' && typeof r.judgement_id==='string' ? r.judgement_id : null;
+    $('fb').hidden=!fbId;
+    if(fbId) fbState(ASK, 'vote');
+  }
+  // 'ok' | 'gone' (404) | 'down' (can't be stored: storage over its daily limit, or misconfigured)
+  // | 'error' (worth retrying) | null (a newer judgement replaced this one meanwhile)
+  async function sendFeedback(body){
+    const id=fbId;
+    $('fb').querySelectorAll('button').forEach(b=>{ b.disabled=true; });
+    let r;
+    try{
+      const res=await fetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,...body})});
+      r = res.ok ? 'ok' : res.status===404 ? 'gone'
+        : res.status===403 || res.status===500 || (await res.json().catch(()=>({}))).error==='storage_unavailable' ? 'down'
+        : 'error';
+    }catch{ r='error'; }
+    return id===fbId ? r : null;
+  }
+  async function answer(step, value){
+    const r=await sendFeedback({[step]:value});
+    const askFinger = step==='vote' && value==='bad';
+    if(r==='ok') fbState(askFinger ? FINGER : THANKS, askFinger ? 'actual' : null);
+    else if(r==='gone' || r==='down') fbState(r==='gone' ? GONE : DOWN);
+    else if(r==='error') fbState(RETRY, step, value);
+  }
+  $('fbVote').onclick=e=>{ const v=e.target.closest('button')?.dataset.vote; if(v) answer('vote', v); };
+  $('fbActual').onclick=e=>{ const v=e.target.closest('button')?.dataset.actual; if(v) answer('actual', v); };
 
   judgeBtn.onclick=async()=>{
     try{ const hint=lastSoil; const b=await captureFrame(); showStill(URL.createObjectURL(b)); await judge(b, hint); }
