@@ -448,12 +448,9 @@ button:focus-visible,.filebtn:focus-within,.field input:focus-visible{outline:3p
   async function sendFeedback(body){
     const id=fbId;
     $('fb').querySelectorAll('button').forEach(b=>{ b.disabled=true; });
-    const post=()=>fetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,...body})});
     let r;
     try{
-      let res=await post();
-      // the judgement is stored just after its result is shown, so a very quick tap can arrive first
-      if(res.status===404){ await new Promise(ok=>setTimeout(ok,1500)); res=await post(); }
+      const res=await fetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,...body})});
       r = res.ok ? 'ok' : res.status===404 ? 'gone'
         : res.status===403 || res.status===500 || (await res.json().catch(()=>({}))).error==='storage_unavailable' ? 'down'
         : 'error';
