@@ -1,0 +1,13 @@
+# pall8t project config: `pall8t run` starts the agent in an apple/container
+# sandbox built from .pall8t/Containerfile (the default probe, so it isn't
+# named here).
+
+[container]
+# Read-only root filesystem, all capabilities dropped, /tmp on tmpfs. The
+# workflow here (npm ci, npm test) only writes to the workspace, the
+# container home (~/.npm) and /tmp, so it works under strict.
+hardening = "strict"
+
+# Forwarding the host SSH agent stays off (a project config can only turn it
+# off anyway). Push over HTTPS with a fine-grained PAT (gh auth login) instead.
+ssh = false

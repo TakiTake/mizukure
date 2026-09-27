@@ -1,0 +1,31 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "mizukure",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-09-01",
+  "observability": { "enabled": true },
+
+  // public/ is served as static files; anything else (e.g. /api/judge) goes to src/worker.js
+  "assets": { "directory": "./public", "binding": "ASSETS" },
+
+  // Workers AI (vision model that turns the photo into text for Jev)
+  "ai": { "binding": "AI" },
+
+  // Per-IP limits on /api/judge. namespace_id is any account-unique integer string you pick.
+  //   PRECHECK_LIMITER: loose, counts every request before Turnstile is verified (caps junk-token floods)
+  //   JUDGE_LIMITER:    strict, counts only Turnstile-verified requests with a valid photo, i.e. the ones
+  //                     about to call Workers AI + Jev (each costs credits)
+  "ratelimits": [
+    { "name": "PRECHECK_LIMITER", "namespace_id": "1002", "simple": { "limit": 60, "period": 60 } },
+    { "name": "JUDGE_LIMITER", "namespace_id": "1001", "simple": { "limit": 10, "period": 60 } }
+  ],
+
+  "vars": {
+    "VISION_MODEL": "@cf/meta/llama-4-scout-17b-16e-instruct",
+    "JEV_MODEL": "jev-latest"
+  }
+  // Secrets (not stored here; until all three are set, /api/judge answers not_configured — see README):
+  //   npx wrangler secret put TYPESAFE_API_KEY
+  //   npx wrangler secret put TURNSTILE_SITE_KEY   (public; kept next to its secret)
+  //   npx wrangler secret put TURNSTILE_SECRET
+}

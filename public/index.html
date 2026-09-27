@@ -141,6 +141,7 @@ button:focus-visible,.filebtn:focus-within,.field input:focus-visible{outline:3p
   </div>
 
   <div class="status" id="status" role="status" aria-live="polite"></div>
+  <div id="ts-box"></div><!-- not id="turnstile": that would shadow window.turnstile -->
 
   <section class="result" id="result" hidden aria-live="polite">
     <div class="verdict">
@@ -168,18 +169,68 @@ button:focus-visible,.filebtn:focus-within,.field input:focus-visible{outline:3p
     <button class="ghost" id="again" style="margin-top:12px;width:100%">もう一度撮る</button>
   </section>
 
-  <p class="note">判定は写真からの推定です。鉢の重さや指で土を2〜3cm触った感触と合わせて使ってください。リアルタイム表示は端末内で土の色だけを見た目安で、照明で大きく変わります。</p>
+  <p class="note">判定は写真をAIが観察し、その内容を Jev（typesafe.ai）が評価した推定です。鉢の重さや指で土を2〜3cm触った感触と合わせて使ってください。リアルタイム表示は端末内で土の色だけを見た目安で、照明で大きく変わります。</p>
 </main>
 
 <script>
 (() => {
   const $ = id => document.getElementById(id);
   const video=$('video'), still=$('still'), judgeBtn=$('judge'), statusEl=$('status');
-  let stream=null, sample=null, busy=false, liveTimer=null, lastLiveAt=0;
+  let stream=null, busy=false, liveTimer=null, lastLiveAt=0, lastSoil=null;
   const work=document.createElement('canvas'); const wctx=work.getContext('2d',{willReadFrequently:true});
 
   try{ const k=localStorage.getItem('plantKind'); if(k) $('kind').value=k; }catch(e){}
   $('kind').addEventListener('change',()=>{ try{ localStorage.setItem('plantKind',$('kind').value.trim()); }catch(e){} });
+
+  // ---- Turnstile (bot check the server requires on every /api/judge call) ----
+  // Invisible unless Cloudflare wants an interaction; each token is single-use.
+  const fail=code=>Object.assign(new Error(code),{code});
+  const withTimeout=(p,ms)=>{
+    let t; const timer=new Promise((_,rej)=>{ t=setTimeout(()=>rej(fail('turnstile_failed')),ms); });
+    return Promise.race([p,timer]).finally(()=>clearTimeout(t));
+  };
+  let turnstileLoad=null;   // cached only on success, so a flaky network can retry on the next judgement
+  let turnstileScript=null; // one <script> load at a time, even if a judgement timed out waiting for it
+
+  function loadTurnstile(){
+    turnstileLoad ||= (async()=>{
+      // the script doesn't need the site key, so fetch both at once
+      turnstileScript ||= new Promise((res,rej)=>{
+        const s=document.createElement('script');
+        s.src='https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+        s.onload=res; s.onerror=()=>{ s.remove(); turnstileScript=null; rej(fail('turnstile_failed')); };
+        document.head.appendChild(s);
+      });
+      const script=withTimeout(turnstileScript,15000);
+      script.catch(()=>{});   // awaited below; don't report it as unhandled if the config fails first
+      const cfg=await fetch('/api/config',{signal:AbortSignal.timeout?.(15000)}).then(r=>r.json()).catch(()=>{ throw fail('turnstile_failed'); });
+      if(!cfg.turnstile_site_key) throw fail('not_configured');
+      await script;
+      return cfg;
+    })().catch(e=>{ turnstileLoad=null; throw e; });
+    return turnstileLoad;
+  }
+  loadTurnstile().catch(()=>{});   // warm up while the camera starts
+
+  async function turnstileToken(){
+    const sitekey=(await loadTurnstile()).turnstile_site_key;
+    let id;
+    const token=new Promise((resolve,reject)=>{
+      const no=()=>reject(fail('turnstile_failed'));
+      id=window.turnstile.render('#ts-box',{
+        sitekey, appearance:'interaction-only',
+        callback:resolve, 'error-callback':no, 'timeout-callback':no, 'unsupported-callback':no,
+        'before-interactive-callback':()=>{
+          setStatus('下のチェックボックスを押してください（ロボットでないことの確認）');
+          $('ts-box').scrollIntoView({behavior:'smooth',block:'center'});
+        },
+      });
+    });
+    // an interactive challenge needs time for the user; after that, give up rather than stay busy
+    try{ return await withTimeout(token,60000); }
+    catch(e){ throw typeof e.code==='string' ? e : fail('turnstile_failed'); }   // e.g. render() threw on a bad site key
+    finally{ try{ window.turnstile.remove(id); }catch(e){} }
+  }
 
   function setStatus(t,err){ statusEl.textContent=t||''; statusEl.classList.toggle('err',!!err); }
 
@@ -203,7 +254,7 @@ button:focus-visible,.filebtn:focus-within,.field input:focus-visible{outline:3p
   function showLiveView(){ still.style.display='none'; video.style.display='block'; $('reticle').style.display=''; $('reticleLabel').style.display=''; if(stream) $('live').hidden=false; }
   function showStill(url){ still.src=url; still.style.display='block'; video.style.display='none'; $('reticle').style.display='none'; $('reticleLabel').style.display='none'; $('live').hidden=true; $('finderEmpty').style.display='none'; }
 
-  // ---- on-device live soil tone (runs locally, no Claude calls) ----
+  // ---- on-device live soil tone (runs locally; also sent to the server as a hint) ----
   function loop(){
     liveTimer=requestAnimationFrame(loop);
     const now=performance.now(); if(now-lastLiveAt<250 || !video.videoWidth || video.style.display==='none') return; lastLiveAt=now;
@@ -225,28 +276,18 @@ button:focus-visible,.filebtn:focus-within,.field input:focus-visible{outline:3p
       const sat = mx===mn?0:(l>0.5?(mx-mn)/(2-mx-mn):(mx-mn)/(mx+mn));
       L+=l; S+=sat; n++;
     }
-    if(n<s*s*0.25){ $('liveVal').textContent='土が見えません'; return; }
+    if(n<s*s*0.25){ $('liveVal').textContent='土が見えません'; lastSoil=null; return; }
     L/=n; S/=n;
     // dry soil: lighter and greyer. Crude, lighting-dependent.
     let dry=(L-0.16)/(0.50-0.16) + (0.35-S)*0.4;
     dry=Math.max(0,Math.min(1,dry));
+    lastSoil={dry,L,S};
     $('liveVal').textContent=Math.round(dry*100)+'%';
     $('livePin').style.left=`calc(${(dry*100).toFixed(1)}% - 2px)`;
   }
 
-  // ---- Claude ----
-  (async()=>{
-    sample=await claude.use('sample').catch(()=>null);
-    if(sample){
-      const lim=await sample.limits().catch(()=>null);
-      if(!lim?.images){ sample=null; setStatus('この画面では画像判定を使えません。claude.ai のアプリかブラウザで開いてください。',true); }
-    }else{
-      setStatus('判定機能に接続できません。claude.ai 上でこのページを開いてください。',true);
-    }
-    updateJudgeBtn();
-  })();
-
-  function updateJudgeBtn(){ judgeBtn.disabled = busy || !sample || !stream; $('file').disabled = busy || !sample; }
+  // ---- server (Cloudflare Worker → Workers AI vision → Jev) ----
+  function updateJudgeBtn(){ judgeBtn.disabled = busy || !stream; $('file').disabled = busy; }
 
   function captureFrame(){
     return new Promise((res,rej)=>{
@@ -258,46 +299,54 @@ button:focus-visible,.filebtn:focus-within,.field input:focus-visible{outline:3p
     });
   }
 
-  function buildPrompt(){
-    const kind=$('kind').value.trim();
-    return `あなたは園芸の専門家です。添付の写真は鉢植えまたは地植えの植物です。写真から「今水やりが必要か」を判定してください。
-${kind?`ユーザーによる植物の種類: ${kind.slice(0,60)}`:'植物の種類は不明なので、写真から推定してください。'}
-
-見るポイント:
-- 葉や茎の萎れ・垂れ下がり・張りの無さ・縁の丸まりや乾燥（wilting）
-- 土の表面の色（明るく白っぽい＝乾燥、暗い＝湿潤）、ひび割れ、鉢との隙間（soil_dryness）
-- 植物の種類ごとの水の好み（多肉植物やサンスベリアは乾かし気味で良い等）
-- 水のやりすぎのサイン（黄変、常に濡れた暗い土）があれば need_percent を下げ、reasons に書く
-
-次のJSONだけを返してください（日本語、説明文なし）:
-{"need_percent":0-100の整数,"verdict":"now"|"soon"|"not_needed"|"unclear","wilting":0-100,"soil_dryness":0-100,"plant_guess":"推定した植物名","reasons":["根拠を短く最大3つ"],"advice":"具体的な一言アドバイス","confidence":0から1の数値,"plant_visible":true/false,"soil_visible":true/false}
-植物や土が写っていない・不鮮明な場合は verdict を "unclear" にし、advice に撮り直し方を書いてください。`;
+  // Shrink big photos (phone originals are often 5–10 MB) before upload.
+  async function shrink(file){
+    try{
+      const bmp=await createImageBitmap(file);
+      const max=1280, k=Math.min(1,max/Math.max(bmp.width,bmp.height));
+      if(k===1 && file.size<1.5e6 && file.type==='image/jpeg') return file;
+      const c=document.createElement('canvas'); c.width=Math.round(bmp.width*k); c.height=Math.round(bmp.height*k);
+      c.getContext('2d').drawImage(bmp,0,0,c.width,c.height);
+      return await new Promise((res,rej)=>c.toBlob(b=>b?res(b):rej(new Error('blob')),'image/jpeg',0.85));
+    }catch(e){ return file; }
   }
 
-  async function judge(blob){
-    if(busy||!sample) return;
-    busy=true; updateJudgeBtn(); setStatus('判定中…（初回は利用の許可を求められます）');
+  async function judge(blob, soilHint){
+    if(busy) return;
+    busy=true; updateJudgeBtn(); setStatus('確認中…');
     try{
-      const r=await sample.json(buildPrompt(),{images:blob, modelTier:'quick'});
+      // the server refuses oversized photos mid-upload, which some browsers report as a network error; say it plainly instead
+      if(blob.size>(await loadTurnstile()).max_image_bytes) throw fail('image_too_large');
+      const fd=new FormData();
+      fd.append('image', blob, 'photo.jpg');
+      fd.append('kind', $('kind').value.trim().slice(0,60));
+      if(soilHint) fd.append('device_soil', JSON.stringify(soilHint));
+      // sent as a header so the server can check it before reading the photo
+      const token=await turnstileToken();
+      setStatus('判定中…（写真を解析しています）');
+      const res=await fetch('/api/judge',{method:'POST',body:fd,headers:{'X-Turnstile-Token':token}});
+      const r=await res.json().catch(()=>({error:'invalid_json'}));
+      if(!res.ok || r.error) throw Object.assign(new Error(r.error||res.status),{code:r.error});
       render(r); setStatus('');
     }catch(e){
       const code=e&&e.code;
       const msg={
-        not_granted:'Claudeの利用が許可されなかったため判定できません。',
-        sampling_disabled:'このアカウントでは判定機能を使えません。',
         rate_limited:'判定の回数が多すぎます。少し時間をおいてから試してください。',
+        turnstile_failed:'ロボットでないことの確認に失敗しました。通信環境を確認して、もう一度試してください。',
         image_rejected:'この画像は使えません。JPEG・PNG・WebP の写真で試してください。',
+        image_too_large:'写真が大きすぎます。別の写真で試してください。',
         invalid_json:'判定結果を読み取れませんでした。もう一度判定してください。',
-        refused:'この写真では判定できませんでした。植物と土を写して撮り直してください。',
-        session_expired:'claude.ai に再ログインしてください。',
-        images_unavailable:'この画面では画像判定を使えません。'
+        vision_failed:'写真の解析に失敗しました。もう一度判定してください。',
+        jev_failed:'判定サーバーに接続できませんでした。少し時間をおいてから試してください。',
+        not_configured:'サーバーの設定が完了していません。管理者に連絡してください。',
+        unavailable:'サーバーが一時的に利用できません。少し時間をおいてから試してください。',
+        forbidden:'このページからは判定できません。公式のページから開き直してください。'
       }[code]||'通信に失敗しました。もう一度判定してください。';
       setStatus(msg,true);
-      if(['not_granted','sampling_disabled','images_unavailable'].includes(code)) sample=null;
     }finally{ busy=false; updateJudgeBtn(); }
   }
 
-  function clamp(v){ v=Number(v); return isFinite(v)?Math.max(0,Math.min(100,Math.round(v))):null; }
+  function clamp(v){ if(v===null||v===undefined||v==='') return null; v=Number(v); return isFinite(v)?Math.max(0,Math.min(100,Math.round(v))):null; }
 
   function render(r){
     r=r||{};
@@ -327,12 +376,12 @@ ${kind?`ユーザーによる植物の種類: ${kind.slice(0,60)}`:'植物の種
   }
 
   judgeBtn.onclick=async()=>{
-    try{ const b=await captureFrame(); showStill(URL.createObjectURL(b)); await judge(b); }
+    try{ const hint=lastSoil; const b=await captureFrame(); showStill(URL.createObjectURL(b)); await judge(b, hint); }
     catch(e){ setStatus('カメラの映像を取得できませんでした。',true); }
   };
   $('file').onchange=async e=>{
     const f=e.target.files&&e.target.files[0]; e.target.value='';
-    if(!f) return; showStill(URL.createObjectURL(f)); await judge(f);
+    if(!f) return; showStill(URL.createObjectURL(f)); await judge(await shrink(f));
   };
   $('again').onclick=()=>{
     $('result').hidden=true; setStatus('');
