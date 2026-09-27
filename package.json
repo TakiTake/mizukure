@@ -2,6 +2,9 @@
   "name": "mizukure",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",

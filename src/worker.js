@@ -14,6 +14,8 @@
 //                                  the page reads it from /api/config)
 //   - binding AI                 (Workers AI, see wrangler.jsonc)
 //   - bindings PRECHECK_LIMITER, JUDGE_LIMITER (per-IP rate limits, see wrangler.jsonc)
+// Optional binding DB (D1): judgements and the page's 👍/👎 feedback are stored there (no photos, no IPs),
+//                to measure how often the verdicts are right. Without it, judging works and nothing is stored.
 // Optional vars: VISION_MODEL, JEV_MODEL, ALLOWED_ORIGINS (comma separated; extra origins that proxy to this
 //                Worker. No CORS headers are sent, so a browser page on another origin can't call it directly)
 //
@@ -40,7 +42,11 @@ export default {
     if (url.pathname === '/api/judge') {
       if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
       const sw = stopwatch();
-      return sw.finish(await handleJudge(request, env, url, sw));
+      return sw.finish(await handleJudge(request, env, ctx, url, sw));
+    }
+    if (url.pathname === '/api/feedback') {
+      if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
+      return handleFeedback(request, env, url);
     }
     if (url.pathname === '/api/config') {
       return json({ turnstile_site_key: env.TURNSTILE_SITE_KEY || null, max_image_bytes: MAX_IMAGE_BYTES });
@@ -49,6 +55,7 @@ export default {
       return json({
         ok: REQUIRED_CONFIG.every(k => env[k]), jev: !!env.TYPESAFE_API_KEY, ai: !!env.AI,
         turnstile: !!(env.TURNSTILE_SITE_KEY && env.TURNSTILE_SECRET), rate_limit: !!(env.PRECHECK_LIMITER && env.JUDGE_LIMITER),
+        db: !!env.DB, // optional: not part of `ok`
       });
     }
     return env.ASSETS.fetch(request);
@@ -57,7 +64,7 @@ export default {
 
 // ---------------------------------------------------------------- /api/judge
 
-async function handleJudge(request, env, url, sw) {
+async function handleJudge(request, env, ctx, url, sw) {
   const origin = request.headers.get('Origin');
   if (!originAllowed(origin, url, env)) return json({ error: 'forbidden' }, 403);
   if (REQUIRED_CONFIG.some(k => !env[k])) return json({ error: 'not_configured' }, 500);
@@ -84,7 +91,7 @@ async function handleJudge(request, env, url, sw) {
 
   let form;
   try {
-    form = await sw.time('upload', () => readFormCapped(request, MAX_BODY_BYTES));
+    form = await sw.time('upload', () => readBodyCapped(request, MAX_BODY_BYTES, 'formData'));
   } catch { return json({ error: 'bad_request' }, 400); } // malformed form, or the client dropped mid-upload
   if (form === null) return json({ error: 'image_too_large' }, 413);
   const image = form.get('image');
@@ -107,15 +114,18 @@ async function handleJudge(request, env, url, sw) {
     return json({ error: 'vision_failed' }, 502);
   }
 
+  const state = buildState(obs, kind, deviceSoil);
+  const record = { models: { vision: env.VISION_MODEL || DEFAULT_VISION_MODEL }, inputs: state };
+
   // Nothing usable in the photo: skip Jev, ask for a retake.
   if (!obs.plant_visible && !obs.soil_visible) {
-    return json(unclearResult(obs, 'The photo shows neither a plant nor soil.'));
+    return judgementResponse(env, ctx, sw, unclearResult(obs, 'The photo shows neither a plant nor soil.'), record);
   }
 
   // 2) observations → calibrated judgement
   let jev;
   try {
-    jev = await sw.time('jev', () => askJev(env, buildState(obs, kind, deviceSoil)));
+    jev = await sw.time('jev', () => askJev(env, state));
   } catch (e) {
     console.error('jev failed', e);
     // Jev throttling or overload is a temporary server-side problem, not the user judging too often
@@ -125,7 +135,89 @@ async function handleJudge(request, env, url, sw) {
   }
 
   // 3) shape for the page
-  return json(toResult(obs, jev));
+  return judgementResponse(env, ctx, sw, toResult(obs, jev), { ...record, models: { ...record.models, jev: jev?.model ?? null }, answers: jev?.answers ?? null });
+}
+
+// ---------------------------------------------------------------- judgement log + feedback (D1)
+
+// Created on first use, so a new deployment needs no migration step. Every write runs it in the same batch.
+// It never changes an existing table: adding a column later needs an ALTER TABLE (a real migration).
+const SCHEMA = `CREATE TABLE IF NOT EXISTS judgements (
+  id TEXT PRIMARY KEY,
+  created_at INTEGER NOT NULL,  -- unix ms
+  pipeline TEXT NOT NULL,       -- how the verdict was made, e.g. 'vision+jev'
+  models TEXT,                  -- JSON {vision, jev}
+  inputs TEXT,                  -- JSON: what Jev was (or would have been) given
+  answers TEXT,                 -- JSON: Jev's answers (null when Jev was skipped)
+  result TEXT NOT NULL,         -- JSON: what the page showed
+  ms TEXT,                      -- JSON: step timings
+  vote TEXT CHECK (vote IN ('good', 'bad')),
+  actual TEXT CHECK (actual IN ('dry', 'moist')),  -- after 👎: what the owner's finger test found
+  feedback_at INTEGER           -- time of the latest feedback
+)`;
+const PIPELINE = 'vision+jev';
+export const FEEDBACK_WINDOW_MS = 24 * 60 * 60 * 1000;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+// Returns the result, and (with a DB) gives it an id and stores it once the timings are final.
+// The write happens after the response is sent, so it adds no latency; if it fails, only the log is lost.
+function judgementResponse(env, ctx, sw, result, record) {
+  if (env.DB) {
+    const id = result.judgement_id = crypto.randomUUID();
+    sw.onFinish(ms => ctx.waitUntil(saveJudgement(env.DB, id, record, result, ms).catch(e => console.error('saving judgement failed', e))));
+  }
+  return json(result);
+}
+
+async function saveJudgement(db, id, record, result, ms) {
+  const insert = db.prepare(
+    'INSERT INTO judgements (id, created_at, pipeline, models, inputs, answers, result, ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+  ).bind(id, Date.now(), PIPELINE, JSON.stringify(record.models), JSON.stringify(record.inputs),
+    record.answers ? JSON.stringify(record.answers) : null, JSON.stringify(result), JSON.stringify(ms));
+  await db.batch([db.prepare(SCHEMA), insert]);
+}
+
+// POST /api/feedback  {id, vote: 'good'|'bad'}  or, after 👎,  {id, actual: 'dry'|'moist'}
+// Each judgement takes one vote and (after 'bad') one `actual`, within a day of judging; sending the same value
+// again succeeds (a retry after a lost response), a different one doesn't. A judgement already passed Turnstile,
+// and ids are random, so this only needs the Origin check and the loose per-IP limit.
+async function handleFeedback(request, env, url) {
+  if (!originAllowed(request.headers.get('Origin'), url, env)) return json({ error: 'forbidden' }, 403);
+  if (!env.DB || !env.PRECHECK_LIMITER) return json({ error: 'not_configured' }, 500);
+  const busy = await limited(env.PRECHECK_LIMITER, rateLimitKey(request.headers.get('CF-Connecting-IP') || ''));
+  if (busy) return busy;
+
+  let text, body;
+  try { text = await readBodyCapped(request, 1024, 'text'); } catch { text = ''; } // client dropped mid-body
+  if (text === null) return json({ error: 'bad_request' }, 413);
+  try { body = JSON.parse(text); } catch {}
+  const { id, vote, actual } = body && typeof body === 'object' ? body : {};
+  if (typeof id !== 'string' || !UUID_RE.test(id)) return json({ error: 'bad_request' }, 400);
+
+  const isVote = ['good', 'bad'].includes(vote) && actual === undefined;
+  const isActual = ['dry', 'moist'].includes(actual) && vote === undefined;
+  if (!isVote && !isActual) return json({ error: 'bad_request' }, 400);
+  // column and extra condition come from this fixed choice, never from the request
+  const [column, value, afterBad] = isVote ? ['vote', vote, ''] : ['actual', actual, " AND vote = 'bad'"];
+  const now = Date.now();
+  const update = env.DB.prepare(
+    `UPDATE judgements SET ${column} = ?1, feedback_at = ?2 WHERE id = ?3 AND (${column} IS NULL OR ${column} = ?1) AND created_at > ?4${afterBad}`,
+  ).bind(value, now, id, now - FEEDBACK_WINDOW_MS);
+
+  let changes;
+  try {
+    const results = await env.DB.batch([env.DB.prepare(SCHEMA), update]);
+    changes = results.at(-1)?.meta?.changes;
+  } catch (e) {
+    console.error('saving feedback failed', e);
+    // distinct from 'unavailable' (limiter hiccup): the page stops asking only when storage itself is down,
+    // e.g. over D1's daily limit, which lasts until midnight UTC
+    return json({ error: 'storage_unavailable' }, 503);
+  }
+  // unknown id (or not stored yet: the judgement is written after its response), a different answer already
+  // given, too old, or `actual` without a 👎 first
+  if (!changes) return json({ error: 'not_found' }, 404);
+  return json({ ok: true });
 }
 
 // ---------------------------------------------------------------- step 1: vision
@@ -437,7 +529,8 @@ export function rateLimitKey(ip) {
 // Parses the multipart body, or returns null as soon as it exceeds max bytes (throws if malformed).
 // Counts bytes as they stream into the parser: Content-Length is optional (chunked uploads), so the
 // header alone can't be trusted.
-async function readFormCapped(request, max) {
+// Reads the body as `as` ('formData' or 'text'), counting bytes as they arrive: null once it is over `max`.
+async function readBodyCapped(request, max, as) {
   if (Number(request.headers.get('Content-Length')) > max) return null;
   let size = 0, tooBig = false;
   const counted = request.body?.pipeThrough(new TransformStream({
@@ -447,7 +540,7 @@ async function readFormCapped(request, max) {
     },
   }));
   try {
-    return await new Response(counted, { headers: { 'Content-Type': request.headers.get('Content-Type') || '' } }).formData();
+    return await new Response(counted, { headers: { 'Content-Type': request.headers.get('Content-Type') || '' } })[as]();
   } catch (e) {
     if (tooBig) return null;
     throw e;
@@ -511,8 +604,10 @@ function toBase64(bytes) {
 function stopwatch() {
   const start = performance.now();
   const ms = {};
+  const after = [];
   return {
     log: false,
+    onFinish(fn) { after.push(fn); },
     async time(name, fn) {
       const t = performance.now();
       try { return await fn(); } finally { ms[name] = Math.round(performance.now() - t); }
@@ -521,6 +616,7 @@ function stopwatch() {
       ms.total = Math.round(performance.now() - start);
       res.headers.set('Server-Timing', Object.entries(ms).map(([k, v]) => `${k};dur=${v}`).join(', '));
       if (this.log) console.log(JSON.stringify({ judge: { status: res.status, ms } }));
+      for (const fn of after) fn(ms);
       return res;
     },
   };
