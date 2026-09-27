@@ -141,6 +141,7 @@ button:focus-visible,.filebtn:focus-within,.field input:focus-visible{outline:3p
   </div>
 
   <div class="status" id="status" role="status" aria-live="polite"></div>
+  <div id="ts-box"></div><!-- not id="turnstile": that would shadow window.turnstile -->
 
   <section class="result" id="result" hidden aria-live="polite">
     <div class="verdict">
@@ -180,6 +181,56 @@ button:focus-visible,.filebtn:focus-within,.field input:focus-visible{outline:3p
 
   try{ const k=localStorage.getItem('plantKind'); if(k) $('kind').value=k; }catch(e){}
   $('kind').addEventListener('change',()=>{ try{ localStorage.setItem('plantKind',$('kind').value.trim()); }catch(e){} });
+
+  // ---- Turnstile (bot check the server requires on every /api/judge call) ----
+  // Invisible unless Cloudflare wants an interaction; each token is single-use.
+  const fail=code=>Object.assign(new Error(code),{code});
+  const withTimeout=(p,ms)=>{
+    let t; const timer=new Promise((_,rej)=>{ t=setTimeout(()=>rej(fail('turnstile_failed')),ms); });
+    return Promise.race([p,timer]).finally(()=>clearTimeout(t));
+  };
+  let turnstileLoad=null;   // cached only on success, so a flaky network can retry on the next judgement
+  let turnstileScript=null; // one <script> load at a time, even if a judgement timed out waiting for it
+
+  function loadTurnstile(){
+    turnstileLoad ||= (async()=>{
+      // the script doesn't need the site key, so fetch both at once
+      turnstileScript ||= new Promise((res,rej)=>{
+        const s=document.createElement('script');
+        s.src='https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+        s.onload=res; s.onerror=()=>{ s.remove(); turnstileScript=null; rej(fail('turnstile_failed')); };
+        document.head.appendChild(s);
+      });
+      const script=withTimeout(turnstileScript,15000);
+      script.catch(()=>{});   // awaited below; don't report it as unhandled if the config fails first
+      const cfg=await fetch('/api/config',{signal:AbortSignal.timeout?.(15000)}).then(r=>r.json()).catch(()=>{ throw fail('turnstile_failed'); });
+      if(!cfg.turnstile_site_key) throw fail('not_configured');
+      await script;
+      return cfg;
+    })().catch(e=>{ turnstileLoad=null; throw e; });
+    return turnstileLoad;
+  }
+  loadTurnstile().catch(()=>{});   // warm up while the camera starts
+
+  async function turnstileToken(){
+    const sitekey=(await loadTurnstile()).turnstile_site_key;
+    let id;
+    const token=new Promise((resolve,reject)=>{
+      const no=()=>reject(fail('turnstile_failed'));
+      id=window.turnstile.render('#ts-box',{
+        sitekey, appearance:'interaction-only',
+        callback:resolve, 'error-callback':no, 'timeout-callback':no, 'unsupported-callback':no,
+        'before-interactive-callback':()=>{
+          setStatus('下のチェックボックスを押してください（ロボットでないことの確認）');
+          $('ts-box').scrollIntoView({behavior:'smooth',block:'center'});
+        },
+      });
+    });
+    // an interactive challenge needs time for the user; after that, give up rather than stay busy
+    try{ return await withTimeout(token,60000); }
+    catch(e){ throw typeof e.code==='string' ? e : fail('turnstile_failed'); }   // e.g. render() threw on a bad site key
+    finally{ try{ window.turnstile.remove(id); }catch(e){} }
+  }
 
   function setStatus(t,err){ statusEl.textContent=t||''; statusEl.classList.toggle('err',!!err); }
 
@@ -262,13 +313,18 @@ button:focus-visible,.filebtn:focus-within,.field input:focus-visible{outline:3p
 
   async function judge(blob, soilHint){
     if(busy) return;
-    busy=true; updateJudgeBtn(); setStatus('判定中…（写真を解析しています）');
+    busy=true; updateJudgeBtn(); setStatus('確認中…');
     try{
+      // the server refuses oversized photos mid-upload, which some browsers report as a network error; say it plainly instead
+      if(blob.size>(await loadTurnstile()).max_image_bytes) throw fail('image_too_large');
       const fd=new FormData();
       fd.append('image', blob, 'photo.jpg');
       fd.append('kind', $('kind').value.trim().slice(0,60));
       if(soilHint) fd.append('device_soil', JSON.stringify(soilHint));
-      const res=await fetch('/api/judge',{method:'POST',body:fd});
+      // sent as a header so the server can check it before reading the photo
+      const token=await turnstileToken();
+      setStatus('判定中…（写真を解析しています）');
+      const res=await fetch('/api/judge',{method:'POST',body:fd,headers:{'X-Turnstile-Token':token}});
       const r=await res.json().catch(()=>({error:'invalid_json'}));
       if(!res.ok || r.error) throw Object.assign(new Error(r.error||res.status),{code:r.error});
       render(r); setStatus('');
@@ -276,12 +332,15 @@ button:focus-visible,.filebtn:focus-within,.field input:focus-visible{outline:3p
       const code=e&&e.code;
       const msg={
         rate_limited:'判定の回数が多すぎます。少し時間をおいてから試してください。',
+        turnstile_failed:'ロボットでないことの確認に失敗しました。通信環境を確認して、もう一度試してください。',
         image_rejected:'この画像は使えません。JPEG・PNG・WebP の写真で試してください。',
         image_too_large:'写真が大きすぎます。別の写真で試してください。',
         invalid_json:'判定結果を読み取れませんでした。もう一度判定してください。',
         vision_failed:'写真の解析に失敗しました。もう一度判定してください。',
         jev_failed:'判定サーバーに接続できませんでした。少し時間をおいてから試してください。',
-        not_configured:'サーバーの設定が完了していません（APIキー未設定）。'
+        not_configured:'サーバーの設定が完了していません。管理者に連絡してください。',
+        unavailable:'サーバーが一時的に利用できません。少し時間をおいてから試してください。',
+        forbidden:'このページからは判定できません。公式のページから開き直してください。'
       }[code]||'通信に失敗しました。もう一度判定してください。';
       setStatus(msg,true);
     }finally{ busy=false; updateJudgeBtn(); }

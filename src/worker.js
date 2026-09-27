@@ -9,24 +9,43 @@
 //
 // Required config:
 //   - secret  TYPESAFE_API_KEY   (wrangler secret put TYPESAFE_API_KEY)
+//   - secret  TURNSTILE_SECRET   (wrangler secret put TURNSTILE_SECRET)
+//   - secret  TURNSTILE_SITE_KEY (public, but a secret so `wrangler deploy` never resets it;
+//                                  the page reads it from /api/config)
 //   - binding AI                 (Workers AI, see wrangler.jsonc)
-// Optional vars: VISION_MODEL, JEV_MODEL, ALLOWED_ORIGINS (comma separated)
+//   - bindings PRECHECK_LIMITER, JUDGE_LIMITER (per-IP rate limits, see wrangler.jsonc)
+// Optional vars: VISION_MODEL, JEV_MODEL, ALLOWED_ORIGINS (comma separated; extra origins that proxy to this
+//                Worker. No CORS headers are sent, so a browser page on another origin can't call it directly)
+//
+// /api/judge spends Workers AI + Jev credits, so every call must pass the Origin check,
+// the per-IP rate limit and a Turnstile check. Missing config fails closed.
 
 const JEV_URL = 'https://api.typesafe.ai/v1/systemone';
+const TURNSTILE_VERIFY_URL = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
 const DEFAULT_VISION_MODEL = '@cf/meta/llama-4-scout-17b-16e-instruct';
 const DEFAULT_JEV_MODEL = 'jev-latest';
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+const MAX_BODY_BYTES = MAX_IMAGE_BYTES + 64 * 1024; // image + small form fields and multipart overhead
+export const SITEVERIFY_TIMEOUT_MS = 5000;
 const ALLOWED_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
+// /api/judge refuses to run (not_configured) unless all of these are set.
+const REQUIRED_CONFIG = ['TYPESAFE_API_KEY', 'AI', 'PRECHECK_LIMITER', 'JUDGE_LIMITER', 'TURNSTILE_SITE_KEY', 'TURNSTILE_SECRET'];
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (url.pathname === '/api/judge') {
       if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
-      return handleJudge(request, env);
+      return handleJudge(request, env, url);
+    }
+    if (url.pathname === '/api/config') {
+      return json({ turnstile_site_key: env.TURNSTILE_SITE_KEY || null, max_image_bytes: MAX_IMAGE_BYTES });
     }
     if (url.pathname === '/api/health') {
-      return json({ ok: true, jev: !!env.TYPESAFE_API_KEY, ai: !!env.AI });
+      return json({
+        ok: REQUIRED_CONFIG.every(k => env[k]), jev: !!env.TYPESAFE_API_KEY, ai: !!env.AI,
+        turnstile: !!(env.TURNSTILE_SITE_KEY && env.TURNSTILE_SECRET), rate_limit: !!(env.PRECHECK_LIMITER && env.JUDGE_LIMITER),
+      });
     }
     return env.ASSETS.fetch(request);
   },
@@ -34,16 +53,42 @@ export default {
 
 // ---------------------------------------------------------------- /api/judge
 
-async function handleJudge(request, env) {
-  if (!originAllowed(request, env)) return json({ error: 'forbidden' }, 403);
-  if (!env.TYPESAFE_API_KEY || !env.AI) return json({ error: 'not_configured' }, 500);
+async function handleJudge(request, env, url) {
+  const origin = request.headers.get('Origin');
+  if (!originAllowed(origin, url, env)) return json({ error: 'forbidden' }, 403);
+  if (REQUIRED_CONFIG.some(k => !env[k])) return json({ error: 'not_configured' }, 500);
+
+  // Two per-IP limits around Turnstile (the token comes in a header, checked before the body is read):
+  //  - PRECHECK (loose) counts every tokened request, capping the siteverify calls one IP can cause.
+  //    Trade-off: someone behind a shared IP (carrier NAT) sending junk above that rate can still
+  //    lock the IP out; the loose threshold only raises the bar. Keep it: without it, a junk flood
+  //    goes straight to siteverify.
+  //  - JUDGE (strict) counts only requests about to make the paid calls: Turnstile passed and the
+  //    photo is valid, so junk tokens and rejected photos don't use up a real user's quota.
+  // Tokens are at most 2048 characters; anything else is refused without asking siteverify.
+  const token = request.headers.get('X-Turnstile-Token');
+  if (!token || token.length > 2048) return json({ error: 'turnstile_failed' }, 403);
+  const ip = request.headers.get('CF-Connecting-IP') || '';
+  const key = rateLimitKey(ip);
+
+  const precheck = await limited(env.PRECHECK_LIMITER, key);
+  if (precheck) return precheck;
+  const verdict = await verifyTurnstile(env, token, ip, origin, url);
+  if (verdict === 'error') return json({ error: 'unavailable' }, 503);
+  if (verdict !== 'pass') return json({ error: 'turnstile_failed' }, 403);
 
   let form;
-  try { form = await request.formData(); } catch { return json({ error: 'bad_request' }, 400); }
+  try {
+    form = await readFormCapped(request, MAX_BODY_BYTES);
+  } catch { return json({ error: 'bad_request' }, 400); } // malformed form, or the client dropped mid-upload
+  if (form === null) return json({ error: 'image_too_large' }, 413);
   const image = form.get('image');
   if (!image || typeof image === 'string') return json({ error: 'image_missing' }, 400);
   if (!ALLOWED_TYPES.has(image.type)) return json({ error: 'image_rejected' }, 415);
   if (image.size > MAX_IMAGE_BYTES) return json({ error: 'image_too_large' }, 413);
+
+  const judged = await limited(env.JUDGE_LIMITER, key);
+  if (judged) return judged;
 
   const kind = String(form.get('kind') || '').trim().slice(0, 60);
   const deviceSoil = parseDeviceSoil(form.get('device_soil'));
@@ -68,8 +113,10 @@ async function handleJudge(request, env) {
     jev = await askJev(env, buildState(obs, kind, deviceSoil));
   } catch (e) {
     console.error('jev failed', e);
-    const status = e.status === 429 || e.status === 529 ? 503 : 502;
-    return json({ error: e.status === 429 ? 'rate_limited' : 'jev_failed' }, status);
+    // Jev throttling or overload is a temporary server-side problem, not the user judging too often
+    // ('rate_limited' is reserved for our own per-IP limit).
+    if (e.status === 429 || e.status === 529) return json({ error: 'unavailable' }, 503);
+    return json({ error: 'jev_failed' }, 502);
   }
 
   // 3) shape for the page
@@ -358,12 +405,93 @@ function parseDeviceSoil(v) {
   } catch { return null; }
 }
 
-function originAllowed(request, env) {
-  const origin = request.headers.get('Origin');
-  if (!origin) return true; // same-origin form posts from some browsers, curl during testing
-  const self = new URL(request.url).origin;
+// Returns an error response when the limiter says no (429) or fails (503), otherwise null.
+async function limited(limiter, key) {
+  try {
+    if ((await limiter.limit({ key })).success) return null;
+    return json({ error: 'rate_limited' }, 429);
+  } catch (e) {
+    console.error('rate limiter failed', e);
+    return json({ error: 'unavailable' }, 503);
+  }
+}
+
+// IPv6 clients usually own a whole /64, so limit per /64 rather than per address.
+export function rateLimitKey(ip) {
+  if (!ip) return 'unknown';
+  ip = ip.replace(/^::ffff:(?=\d+\.\d+\.\d+\.\d+$)/i, ''); // IPv4-mapped IPv6 → IPv4
+  if (!ip.includes(':')) return ip;
+  const [head, tail = ''] = ip.toLowerCase().split('::');
+  const h = head ? head.split(':') : [];
+  const t = tail ? tail.split(':') : [];
+  const groups = [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill('0'), ...t];
+  return groups.slice(0, 4).map(g => g.replace(/^0+(?=.)/, '')).join(':') + '::/64';
+}
+
+// Parses the multipart body, or returns null as soon as it exceeds max bytes (throws if malformed).
+// Counts bytes as they stream into the parser: Content-Length is optional (chunked uploads), so the
+// header alone can't be trusted.
+async function readFormCapped(request, max) {
+  if (Number(request.headers.get('Content-Length')) > max) return null;
+  let size = 0, tooBig = false;
+  const counted = request.body?.pipeThrough(new TransformStream({
+    transform(chunk, c) {
+      size += chunk.byteLength;
+      if (size > max) { tooBig = true; c.error(new Error('body too large')); } else c.enqueue(chunk);
+    },
+  }));
+  try {
+    return await new Response(counted, { headers: { 'Content-Type': request.headers.get('Content-Type') || '' } }).formData();
+  } catch (e) {
+    if (tooBig) return null;
+    throw e;
+  }
+}
+
+// siteverify error codes that mean our config, our request or Cloudflare is at fault, not the visitor's token.
+const SITEVERIFY_OUR_FAULT = new Set(['missing-input-secret', 'invalid-input-secret', 'bad-request', 'internal-error']);
+const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
+
+// Returns 'pass', 'reject' (bad token) or 'error' (siteverify unreachable / garbled / misconfigured:
+// our problem, not the user's).
+// Turnstile tokens are single-use; the page gets a fresh one per judgement.
+// hostname must match the page that asked, so tokens minted on another site using this key are refused.
+// Cloudflare's test keys always report hostname "example.com", so that one check is skipped when the
+// Worker itself runs on localhost (wrangler dev). That is decided by the Worker's own URL, not by the
+// client-controlled Origin, so a test secret deployed by mistake can't switch Turnstile off in production.
+async function verifyTurnstile(env, token, ip, origin, url) {
+  let host;
+  try { host = new URL(origin).hostname; } catch { return 'reject'; } // e.g. Origin "null" allowed by mistake
+  const workerIsLocal = LOCAL_HOSTS.has(url.hostname);
+  try {
+    const res = await fetch(TURNSTILE_VERIFY_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ secret: env.TURNSTILE_SECRET, response: token, ...(ip && { remoteip: ip }) }),
+      signal: AbortSignal.timeout(SITEVERIFY_TIMEOUT_MS),
+    });
+    const out = await res.json();
+    const localTestKey = out.metadata?.result_with_testing_key === true && workerIsLocal;
+    if (out.success === true && (out.hostname === host || localTestKey)) return 'pass';
+    if (out['error-codes']?.some(c => SITEVERIFY_OUR_FAULT.has(c))) {
+      console.error('turnstile siteverify refused our request', out['error-codes']);
+      return 'error';
+    }
+    // Usually a bad token; these two usually mean a widget/hostname or test-key misconfiguration, so log them.
+    if (out.success === true) console.warn('turnstile token for another host', { token_host: out.hostname, host, test_key: !!out.metadata?.result_with_testing_key });
+    return 'reject';
+  } catch (e) {
+    console.error('turnstile verify failed', e);
+    return 'error';
+  }
+}
+
+// Not a security boundary on its own (non-browser clients can send any Origin);
+// it keeps other sites' pages from using this endpoint. Browsers always send Origin on POST.
+function originAllowed(origin, url, env) {
+  if (!origin) return false;
   const extra = String(env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
-  return origin === self || extra.includes(origin);
+  return origin === url.origin || extra.includes(origin);
 }
 
 function toBase64(bytes) {
