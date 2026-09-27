@@ -118,13 +118,42 @@ test('retries Jev on 429 then succeeds', async (t) => {
 });
 
 test('Jev throttled or overloaded (429/529 on every retry) → 503 unavailable, not the user\'s rate_limited', async (t) => {
+  // backs off 400 then 800 ms, with no wait after the last attempt
+  const realSetTimeout = globalThis.setTimeout;
+  let delays;
+  t.mock.method(globalThis, 'setTimeout', (fn, ms, ...args) => { delays.push(ms); return realSetTimeout(fn, 0, ...args); });
   for (const status of [429, 529]) {
+    delays = [];
     const jev = mockFetch(t, () => new Response('busy', { status }));
     const res = await worker.fetch(judgeRequest(), makeEnv());
     assert.equal(res.status, 503, status);
     assert.equal((await res.json()).error, 'unavailable', status);
     assert.equal(jev.seen.length, 3, status);
+    assert.deepEqual(delays, [400, 800], status);
   }
+});
+
+test('Server-Timing header and log line carry per-step timings', async (t) => {
+  const logs = t.mock.method(console, 'log', () => {});
+  mockFetch(t, () => Response.json(jevAnswer(2)));
+  const res = await worker.fetch(judgeRequest(), makeEnv());
+  assert.equal(res.status, 200);
+  const header = res.headers.get('Server-Timing');
+  assert.match(header, /^turnstile;dur=\d+, upload;dur=\d+, vision;dur=\d+, jev;dur=\d+, total;dur=\d+$/);
+  assert.equal(logs.mock.callCount(), 1);
+  const line = JSON.parse(logs.mock.calls[0].arguments[0]);
+  assert.equal(line.judge.status, 200);
+  assert.deepEqual(Object.keys(line.judge.ms), ['turnstile', 'upload', 'vision', 'jev', 'total']);
+
+  // a refusal still reports the steps it reached in the header, but isn't logged (junk shouldn't fill the logs)
+  const refused = await worker.fetch(judgeRequest({}, { Origin: 'https://evil.example' }), makeEnv());
+  assert.equal(refused.status, 403);
+  assert.match(refused.headers.get('Server-Timing'), /^total;dur=\d+$/);
+  mockFetch(t, noJev, { turnstile: { success: false } });
+  const junk = await worker.fetch(judgeRequest(), makeEnv());
+  assert.equal(junk.status, 403);
+  assert.match(junk.headers.get('Server-Timing'), /^turnstile;dur=\d+, total;dur=\d+$/);
+  assert.equal(logs.mock.callCount(), 1);
 });
 
 test('Jev 401 → jev_failed without retry', async (t) => {

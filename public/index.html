@@ -210,26 +210,57 @@ button:focus-visible,.filebtn:focus-within,.field input:focus-visible{outline:3p
     })().catch(e=>{ turnstileLoad=null; throw e; });
     return turnstileLoad;
   }
-  loadTurnstile().catch(()=>{});   // warm up while the camera starts
+  // A token is requested ahead of time (at page load, after each judgement, on returning to the tab), so a judgement
+  // usually doesn't wait for Turnstile. Tokens expire after 300 s; an older one is replaced, and so is
+  // a request that has been pending for a minute (e.g. its iframe was frozen in a background tab).
+  const TOKEN_MAX_AGE=240000, PENDING_MAX_AGE=60000;
+  let ahead=null;   // the prefetched request: {token, id, started, at (when the token arrived), failed, dropped, interactive}
+
+  function askToSolve(){
+    setStatus('下のチェックボックスを押してください（ロボットでないことの確認）');
+    $('ts-box').scrollIntoView({behavior:'smooth',block:'center'});
+  }
+  // a request dropped before its widget exists (still loading the script) must not render one later
+  function drop(req){ req.dropped=true; try{ if(req.id) window.turnstile.remove(req.id); }catch(e){} }
+
+  function requestToken(){
+    const req={started:Date.now(), at:0, failed:false};
+    req.token=(async()=>{
+      const sitekey=(await loadTurnstile()).turnstile_site_key;
+      if(req.dropped) throw fail('turnstile_failed');
+      try{
+        return await new Promise((resolve,reject)=>{
+          const no=()=>reject(fail('turnstile_failed'));
+          req.id=window.turnstile.render('#ts-box',{
+            sitekey, appearance:'interaction-only',
+            callback:resolve, 'error-callback':no, 'timeout-callback':no, 'unsupported-callback':no,
+            // Once a judgement has taken this request, explain the checkbox. A prefetch nobody is waiting
+            // for is dropped (the judgement asks again and explains why); if a judgement is about to take
+            // it, turnstileToken() explains when it does.
+            'before-interactive-callback':()=>{ if(ahead!==req) askToSolve(); else if(busy) req.interactive=true; else no(); },
+          });
+        });
+      }
+      catch(e){ throw typeof e.code==='string' ? e : fail('turnstile_failed'); }   // e.g. render() threw on a bad site key
+      finally{ drop(req); }
+    })();
+    req.token.then(()=>{ req.at=Date.now(); },()=>{ req.failed=true; });
+    return req;
+  }
+
+  const usable=req=>req && !req.failed && (req.at ? Date.now()-req.at<TOKEN_MAX_AGE : Date.now()-req.started<PENDING_MAX_AGE);
+  // the prefetched request if still good, otherwise null (removing a stale widget)
+  function takeAhead(){ const req=ahead; ahead=null; if(req && !usable(req)){ drop(req); return null; } return req; }
+  function prefetchToken(){ ahead=takeAhead()||requestToken(); }
+  prefetchToken();   // warm up while the camera starts
+  document.addEventListener('visibilitychange',()=>{ if(!document.hidden && !busy) prefetchToken(); });
 
   async function turnstileToken(){
-    const sitekey=(await loadTurnstile()).turnstile_site_key;
-    let id;
-    const token=new Promise((resolve,reject)=>{
-      const no=()=>reject(fail('turnstile_failed'));
-      id=window.turnstile.render('#ts-box',{
-        sitekey, appearance:'interaction-only',
-        callback:resolve, 'error-callback':no, 'timeout-callback':no, 'unsupported-callback':no,
-        'before-interactive-callback':()=>{
-          setStatus('下のチェックボックスを押してください（ロボットでないことの確認）');
-          $('ts-box').scrollIntoView({behavior:'smooth',block:'center'});
-        },
-      });
-    });
+    const req=takeAhead()||requestToken();
+    if(req.interactive && !req.at) askToSolve();   // unless it was already solved while idle
     // an interactive challenge needs time for the user; after that, give up rather than stay busy
-    try{ return await withTimeout(token,60000); }
-    catch(e){ throw typeof e.code==='string' ? e : fail('turnstile_failed'); }   // e.g. render() threw on a bad site key
-    finally{ try{ window.turnstile.remove(id); }catch(e){} }
+    try{ return await withTimeout(req.token,60000); }
+    catch(e){ drop(req); throw e; }
   }
 
   function setStatus(t,err){ statusEl.textContent=t||''; statusEl.classList.toggle('err',!!err); }
@@ -343,7 +374,7 @@ button:focus-visible,.filebtn:focus-within,.field input:focus-visible{outline:3p
         forbidden:'このページからは判定できません。公式のページから開き直してください。'
       }[code]||'通信に失敗しました。もう一度判定してください。';
       setStatus(msg,true);
-    }finally{ busy=false; updateJudgeBtn(); }
+    }finally{ busy=false; updateJudgeBtn(); prefetchToken(); }   // the next judgement's token
   }
 
   function clamp(v){ if(v===null||v===undefined||v==='') return null; v=Number(v); return isFinite(v)?Math.max(0,Math.min(100,Math.round(v))):null; }
