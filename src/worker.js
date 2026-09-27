@@ -19,6 +19,9 @@
 //
 // /api/judge spends Workers AI + Jev credits, so every call must pass the Origin check,
 // the per-IP rate limit and a Turnstile check. Missing config fails closed.
+//
+// Each /api/judge response carries a Server-Timing header (turnstile, upload, vision, jev, total in ms)
+// and the same numbers are logged as one JSON line, so the time spent per step can be compared across versions.
 
 const JEV_URL = 'https://api.typesafe.ai/v1/systemone';
 const TURNSTILE_VERIFY_URL = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
@@ -36,7 +39,8 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === '/api/judge') {
       if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
-      return handleJudge(request, env, url);
+      const sw = stopwatch();
+      return sw.finish(await handleJudge(request, env, url, sw));
     }
     if (url.pathname === '/api/config') {
       return json({ turnstile_site_key: env.TURNSTILE_SITE_KEY || null, max_image_bytes: MAX_IMAGE_BYTES });
@@ -53,7 +57,7 @@ export default {
 
 // ---------------------------------------------------------------- /api/judge
 
-async function handleJudge(request, env, url) {
+async function handleJudge(request, env, url, sw) {
   const origin = request.headers.get('Origin');
   if (!originAllowed(origin, url, env)) return json({ error: 'forbidden' }, 403);
   if (REQUIRED_CONFIG.some(k => !env[k])) return json({ error: 'not_configured' }, 500);
@@ -73,13 +77,14 @@ async function handleJudge(request, env, url) {
 
   const precheck = await limited(env.PRECHECK_LIMITER, key);
   if (precheck) return precheck;
-  const verdict = await verifyTurnstile(env, token, ip, origin, url);
+  const verdict = await sw.time('turnstile', () => verifyTurnstile(env, token, ip, origin, url));
   if (verdict === 'error') return json({ error: 'unavailable' }, 503);
   if (verdict !== 'pass') return json({ error: 'turnstile_failed' }, 403);
+  sw.log = true; // log timings only from here on, so junk requests don't fill the logs
 
   let form;
   try {
-    form = await readFormCapped(request, MAX_BODY_BYTES);
+    form = await sw.time('upload', () => readFormCapped(request, MAX_BODY_BYTES));
   } catch { return json({ error: 'bad_request' }, 400); } // malformed form, or the client dropped mid-upload
   if (form === null) return json({ error: 'image_too_large' }, 413);
   const image = form.get('image');
@@ -96,7 +101,7 @@ async function handleJudge(request, env, url) {
   // 1) photo → observations
   let obs;
   try {
-    obs = await describePhoto(env, image, kind);
+    obs = await sw.time('vision', () => describePhoto(env, image, kind));
   } catch (e) {
     console.error('vision failed', e);
     return json({ error: 'vision_failed' }, 502);
@@ -110,7 +115,7 @@ async function handleJudge(request, env, url) {
   // 2) observations → calibrated judgement
   let jev;
   try {
-    jev = await askJev(env, buildState(obs, kind, deviceSoil));
+    jev = await sw.time('jev', () => askJev(env, buildState(obs, kind, deviceSoil)));
   } catch (e) {
     console.error('jev failed', e);
     // Jev throttling or overload is a temporary server-side problem, not the user judging too often
@@ -293,10 +298,11 @@ export function buildState(obs, kind, deviceSoil) {
   return state;
 }
 
+const JEV_ATTEMPTS = 3;
+
 async function askJev(env, state) {
   const body = JSON.stringify({ model: env.JEV_MODEL || DEFAULT_JEV_MODEL, state, questions: QUESTIONS });
-  let lastErr;
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 1; ; attempt++) {
     const res = await fetch(JEV_URL, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${env.TYPESAFE_API_KEY}`, 'Content-Type': 'application/json' },
@@ -304,11 +310,11 @@ async function askJev(env, state) {
     });
     if (res.ok) return res.json();
     const text = await res.text().catch(() => '');
-    lastErr = Object.assign(new Error(`Jev ${res.status}: ${text.slice(0, 300)}`), { status: res.status });
-    if (res.status !== 429 && res.status !== 529) break; // only retry rate-limit / overload
-    await new Promise(r => setTimeout(r, 400 * 2 ** attempt));
+    const err = Object.assign(new Error(`Jev ${res.status}: ${text.slice(0, 300)}`), { status: res.status });
+    // only retry rate-limit / overload, and don't wait after the last attempt
+    if ((res.status !== 429 && res.status !== 529) || attempt === JEV_ATTEMPTS) throw err;
+    await new Promise(r => setTimeout(r, 400 * 2 ** (attempt - 1)));
   }
-  throw lastErr;
 }
 
 // ---------------------------------------------------------------- step 3: result
@@ -498,6 +504,26 @@ function toBase64(bytes) {
   let s = '';
   for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
   return btoa(s);
+}
+
+// Times the steps of one request. finish() adds the Server-Timing header, and logs the numbers if `log` was set.
+// (In Workers the clock only advances across I/O, which is what these steps wait on.)
+function stopwatch() {
+  const start = performance.now();
+  const ms = {};
+  return {
+    log: false,
+    async time(name, fn) {
+      const t = performance.now();
+      try { return await fn(); } finally { ms[name] = Math.round(performance.now() - t); }
+    },
+    finish(res) {
+      ms.total = Math.round(performance.now() - start);
+      res.headers.set('Server-Timing', Object.entries(ms).map(([k, v]) => `${k};dur=${v}`).join(', '));
+      if (this.log) console.log(JSON.stringify({ judge: { status: res.status, ms } }));
+      return res;
+    },
+  };
 }
 
 function json(obj, status = 200) {
