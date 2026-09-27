@@ -114,8 +114,8 @@ async function handleJudge(request, env, ctx, url, sw) {
     return json({ error: 'vision_failed' }, 502);
   }
 
-  const state = buildState(obs, kind, deviceSoil);
-  const record = { models: { vision: env.VISION_MODEL || DEFAULT_VISION_MODEL }, inputs: state };
+  const state = buildState(obs, kind);
+  const record = { models: { vision: env.VISION_MODEL || DEFAULT_VISION_MODEL }, inputs: state, deviceSoil };
 
   // Nothing usable in the photo: skip Jev, ask for a retake.
   if (!obs.plant_visible && !obs.soil_visible) {
@@ -148,6 +148,7 @@ const SCHEMA = `CREATE TABLE IF NOT EXISTS judgements (
   pipeline TEXT NOT NULL,       -- how the verdict was made, e.g. 'vision+jev'
   models TEXT,                  -- JSON {vision, jev}
   inputs TEXT,                  -- JSON: what Jev was (or would have been) given
+  device_soil TEXT,             -- JSON: the phone's colour reading of the soil (not given to Jev), for calibration
   answers TEXT,                 -- JSON: Jev's answers (null when Jev was skipped)
   result TEXT NOT NULL,         -- JSON: what the page showed
   ms TEXT,                      -- JSON: step timings
@@ -171,8 +172,9 @@ function judgementResponse(env, ctx, sw, result, record) {
 
 async function saveJudgement(db, id, record, result, ms) {
   const insert = db.prepare(
-    'INSERT INTO judgements (id, created_at, pipeline, models, inputs, answers, result, ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    'INSERT INTO judgements (id, created_at, pipeline, models, inputs, device_soil, answers, result, ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
   ).bind(id, Date.now(), PIPELINE, JSON.stringify(record.models), JSON.stringify(record.inputs),
+    record.deviceSoil ? JSON.stringify(record.deviceSoil) : null,
     record.answers ? JSON.stringify(record.answers) : null, JSON.stringify(result), JSON.stringify(ms));
   await db.batch([db.prepare(SCHEMA), insert]);
 }
@@ -359,7 +361,7 @@ export const QUESTIONS = {
   },
 };
 
-export function buildState(obs, kind, deviceSoil) {
+export function buildState(obs, kind) {
   const state = {
     owner_says_plant_is: kind || 'not specified',
     photo_observations: {
@@ -379,14 +381,6 @@ export function buildState(obs, kind, deviceSoil) {
       other_notes: obs.other_notes,
     },
   };
-  if (deviceSoil) {
-    state.on_device_soil_colour_measurement = {
-      note: 'Rough measurement of the soil area by the phone; strongly affected by lighting.',
-      estimated_dryness_percent: deviceSoil.dry,
-      lightness_0_to_1: deviceSoil.L,
-      saturation_0_to_1: deviceSoil.S,
-    };
-  }
   return state;
 }
 
@@ -492,14 +486,18 @@ function unclearResult(obs, why) {
 
 // ---------------------------------------------------------------- helpers
 
+// The page's colour reading of the soil in its circle: {dry (its crude estimate), L, S, R, G, B, frac}, each 0..1.
+// Stored for calibration only; anything else in it is dropped.
 function parseDeviceSoil(v) {
   if (!v || typeof v !== 'string') return null;
   try {
     const o = JSON.parse(v);
-    const n = x => (isFinite(Number(x)) ? Math.round(Number(x) * 1000) / 1000 : null);
-    const dry = Number(o.dry);
-    if (!isFinite(dry)) return null;
-    return { dry: Math.round(Math.max(0, Math.min(1, dry)) * 100), L: n(o.L), S: n(o.S) };
+    const out = {};
+    for (const k of ['dry', 'L', 'S', 'R', 'G', 'B', 'frac']) {
+      const x = o?.[k];
+      out[k] = typeof x === 'number' && isFinite(x) ? Math.round(Math.max(0, Math.min(1, x)) * 1000) / 1000 : null;
+    }
+    return out.dry === null ? null : out;
   } catch { return null; }
 }
 

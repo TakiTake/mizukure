@@ -43,23 +43,16 @@ h1{font-size:1.35rem; font-weight:900; margin:4px 0 2px; letter-spacing:.02em; c
 }
 .finder video,.finder img.still{position:absolute; inset:0; width:100%; height:100%; object-fit:cover}
 .finder img.still{display:none}
+.reticle,.reticle-label{display:none}   /* shown with the live camera view (showLiveView) */
 .reticle{
   position:absolute; left:50%; top:62%; width:34%; aspect-ratio:1; transform:translate(-50%,-50%);
   border:2px dashed rgba(255,255,255,.85); border-radius:50%; pointer-events:none;
 }
+/* above the circle: the finder is 4:5, so the circle (34% of the width) spans 48.4%–75.6% of the height */
 .reticle-label{
-  position:absolute; left:50%; top:77%; transform:translateX(-50%);
+  position:absolute; left:50%; top:46%; transform:translate(-50%,-100%);
   color:#fff; font-size:.75rem; background:rgba(0,0,0,.45); padding:2px 10px; border-radius:99px; white-space:nowrap;
 }
-.live{
-  position:absolute; left:12px; right:12px; bottom:12px; padding:10px 12px;
-  background:rgba(14,22,17,.62); backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px);
-  border-radius:16px; color:#fff; font-size:.78rem;
-}
-.live-row{display:flex; justify-content:space-between; align-items:baseline; gap:8px}
-.live-bar{height:8px; border-radius:99px; margin-top:6px;
-  background:linear-gradient(90deg,#3b2a1e 0%,#7a5238 45%,#c9ad8a 100%); position:relative}
-.live-pin{position:absolute; top:-4px; width:4px; height:16px; background:#fff; border-radius:2px; left:0; transition:left .25s}
 .finder-empty{
   position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center;
   gap:12px; padding:24px; text-align:center; color:#dfe8e1;
@@ -113,7 +106,7 @@ button:focus-visible,.filebtn:focus-within,.field input:focus-visible{outline:3p
 .status{margin-top:14px; font-size:.9rem; color:var(--muted); min-height:1.4em}
 .status.err{color:var(--warn)}
 .note{margin-top:22px; font-size:.78rem; color:var(--muted)}
-@media (prefers-reduced-motion: reduce){ .meter-fill,.live-pin{transition:none} .drop-water{transition:none!important} }
+@media (prefers-reduced-motion: reduce){ .meter-fill{transition:none} .drop-water{transition:none!important} }
 </style>
 </head>
 <body>
@@ -125,12 +118,7 @@ button:focus-visible,.filebtn:focus-within,.field input:focus-visible{outline:3p
     <video id="video" playsinline muted autoplay></video>
     <img class="still" id="still" alt="判定に使った写真">
     <div class="reticle" id="reticle"></div>
-    <div class="reticle-label" id="reticleLabel">ここに土を入れる</div>
-    <div class="live" id="live" hidden>
-      <div class="live-row"><span>土の色から見た乾き（リアルタイムの目安）</span><strong id="liveVal">–</strong></div>
-      <div class="live-bar"><div class="live-pin" id="livePin"></div></div>
-      <div class="live-row" style="opacity:.75;margin-top:2px"><span>湿っている</span><span>乾いている</span></div>
-    </div>
+    <div class="reticle-label" id="reticleLabel">この円に土の表面を合わせてください</div>
     <div class="finder-empty" id="finderEmpty">
       <p id="finderMsg">カメラを使うには下のボタンを押してください。</p>
       <button class="ghost" id="startCam" style="color:#dfe8e1;border-color:#dfe8e1">カメラを起動</button>
@@ -188,15 +176,14 @@ button:focus-visible,.filebtn:focus-within,.field input:focus-visible{outline:3p
     <button class="ghost" id="again" style="margin-top:12px;width:100%">もう一度撮る</button>
   </section>
 
-  <p class="note">判定は写真をAIが観察し、その内容を Jev（typesafe.ai）が評価した推定です。鉢の重さや指で土を2〜3cm触った感触と合わせて使ってください。リアルタイム表示は端末内で土の色だけを見た目安で、照明で大きく変わります。判定の内容（AIによる写真の観察メモ、植物の種類の入力、端末で測った土の色、判定結果。写真そのものとIPアドレスは含みません）は、精度の改善のために保存しています。</p>
+  <p class="note">判定は写真をAIが観察し、その内容を Jev（typesafe.ai）が評価した推定です。鉢の重さや指で土を2〜3cm触った感触と合わせて使ってください。判定の内容（AIによる写真の観察メモ、植物の種類の入力、端末で測った土の色、判定結果。写真そのものとIPアドレスは含みません）は、精度の改善のために保存しています。</p>
 </main>
 
 <script>
 (() => {
   const $ = id => document.getElementById(id);
   const video=$('video'), still=$('still'), judgeBtn=$('judge'), statusEl=$('status');
-  let stream=null, busy=false, liveTimer=null, lastLiveAt=0, lastSoil=null;
-  const work=document.createElement('canvas'); const wctx=work.getContext('2d',{willReadFrequently:true});
+  let stream=null, busy=false;
 
   try{ const k=localStorage.getItem('plantKind'); if(k) $('kind').value=k; }catch(e){}
   $('kind').addEventListener('change',()=>{ try{ localStorage.setItem('plantKind',$('kind').value.trim()); }catch(e){} });
@@ -290,8 +277,8 @@ button:focus-visible,.filebtn:focus-within,.field input:focus-visible{outline:3p
     try{
       stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:1600}},audio:false});
       video.srcObject=stream; await video.play().catch(()=>{});
-      $('finderEmpty').style.display='none'; $('live').hidden=false;
-      showLiveView(); updateJudgeBtn(); loop();
+      $('finderEmpty').style.display='none';
+      showLiveView(); updateJudgeBtn();
     }catch(e){
       camFail(e && e.name==='NotAllowedError'
         ? 'カメラの使用が許可されませんでした。「写真を選ぶ」から撮影して判定できます。'
@@ -301,13 +288,15 @@ button:focus-visible,.filebtn:focus-within,.field input:focus-visible{outline:3p
   function camFail(msg){ $('finderMsg').textContent=msg; $('startCam').style.display='none'; }
   $('startCam').onclick=startCamera;
 
-  function showLiveView(){ still.style.display='none'; video.style.display='block'; $('reticle').style.display=''; $('reticleLabel').style.display=''; if(stream) $('live').hidden=false; }
-  function showStill(url){ still.src=url; still.style.display='block'; video.style.display='none'; $('reticle').style.display='none'; $('reticleLabel').style.display='none'; $('live').hidden=true; $('finderEmpty').style.display='none'; }
+  function showLiveView(){ still.style.display='none'; video.style.display='block'; $('reticle').style.display='block'; $('reticleLabel').style.display='block'; }
+  function showStill(url){ still.src=url; still.style.display='block'; video.style.display='none'; $('reticle').style.display='none'; $('reticleLabel').style.display='none'; $('finderEmpty').style.display='none'; }
 
-  // ---- on-device live soil tone (runs locally; also sent to the server as a hint) ----
-  function loop(){
-    liveTimer=requestAnimationFrame(loop);
-    const now=performance.now(); if(now-lastLiveAt<250 || !video.videoWidth || video.style.display==='none') return; lastLiveAt=now;
+  // ---- on-device soil colour inside the circle ----
+  // Not shown (the formula below is too crude to trust) and not given to Jev: it is stored with each judgement,
+  // next to the owner's 👍/👎 and finger-test answer, to calibrate an on-device dryness meter later.
+  // Measured once, from the frame being judged; null when the circle is mostly leaves.
+  function measureSoil(){
+    if(!video.videoWidth) return null;
     const vw=video.videoWidth, vh=video.videoHeight;
     // map reticle (center at 50%,62% of the cover-fitted box) back to video pixels
     const box=$('finder').getBoundingClientRect();
@@ -315,25 +304,24 @@ button:focus-visible,.filebtn:focus-within,.field input:focus-visible{outline:3p
     const dispW=vw*scale, dispH=vh*scale, offX=(dispW-box.width)/2, offY=(dispH-box.height)/2;
     const r=(box.width*0.34/2)/scale;
     const cx=(box.width*0.5+offX)/scale, cy=(box.height*0.62+offY)/scale;
-    const s=48; work.width=s; work.height=s;
+    const s=48, work=document.createElement('canvas'); work.width=s; work.height=s;
+    const wctx=work.getContext('2d');
     wctx.drawImage(video, cx-r*0.7, cy-r*0.7, r*1.4, r*1.4, 0,0,s,s);
     const d=wctx.getImageData(0,0,s,s).data;
-    let L=0,S=0,n=0;
+    let L=0,S=0,sr=0,sg=0,sb=0,n=0;
     for(let i=0;i<d.length;i+=4){
       const R=d[i]/255,G=d[i+1]/255,B=d[i+2]/255;
       const mx=Math.max(R,G,B), mn=Math.min(R,G,B), l=(mx+mn)/2;
       if(G>R*1.15 && G>B*1.1) continue; // skip leaves
       const sat = mx===mn?0:(l>0.5?(mx-mn)/(2-mx-mn):(mx-mn)/(mx+mn));
-      L+=l; S+=sat; n++;
+      L+=l; S+=sat; sr+=R; sg+=G; sb+=B; n++;
     }
-    if(n<s*s*0.25){ $('liveVal').textContent='土が見えません'; lastSoil=null; return; }
+    const frac=n/(s*s);   // share of the sampled square (inside the circle) that isn't leaves
+    if(frac<0.25) return null;
     L/=n; S/=n;
-    // dry soil: lighter and greyer. Crude, lighting-dependent.
-    let dry=(L-0.16)/(0.50-0.16) + (0.35-S)*0.4;
-    dry=Math.max(0,Math.min(1,dry));
-    lastSoil={dry,L,S};
-    $('liveVal').textContent=Math.round(dry*100)+'%';
-    $('livePin').style.left=`calc(${(dry*100).toFixed(1)}% - 2px)`;
+    // dry soil: lighter and greyer. Crude and lighting-dependent (kept to compare with better measures later).
+    const dry=Math.max(0,Math.min(1,(L-0.16)/(0.50-0.16) + (0.35-S)*0.4));
+    return {dry,L,S,R:sr/n,G:sg/n,B:sb/n,frac};
   }
 
   // ---- server (Cloudflare Worker → Workers AI vision → Jev) ----
@@ -468,7 +456,8 @@ button:focus-visible,.filebtn:focus-within,.field input:focus-visible{outline:3p
   $('fbActual').onclick=e=>{ const v=e.target.closest('button')?.dataset.actual; if(v) answer('actual', v); };
 
   judgeBtn.onclick=async()=>{
-    try{ const hint=lastSoil; const b=await captureFrame(); showStill(URL.createObjectURL(b)); await judge(b, hint); }
+    let hint=null; try{ hint=measureSoil(); }catch{}   // a failed measurement only loses the hint, not the judgement
+    try{ const b=await captureFrame(); showStill(URL.createObjectURL(b)); await judge(b, hint); }
     catch(e){ setStatus('カメラの映像を取得できませんでした。',true); }
   };
   $('file').onchange=async e=>{
